@@ -61,7 +61,7 @@ struct IMUData
     V3D gyro;
     double time;
     IMUData() = default;
-    IMUData(const V3D &a, const V3D &g, double &t) : acc(a), gyro(g), time(t) {}
+    IMUData(const V3D &a, const V3D &g, double t) : acc(a), gyro(g), time(t) {}
 };
 
 struct Pose

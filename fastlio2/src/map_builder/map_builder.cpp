@@ -8,6 +8,10 @@ MapBuilder::MapBuilder(Config &config, std::shared_ptr<IESKF> kf) : m_config(con
 
 void MapBuilder::process(SyncPackage &package)
 {
+    if (!package.cloud || package.cloud->empty() || package.imus.empty())
+    {
+        return;
+    }
     if (m_status == BuilderStatus::IMU_INIT)
     {
         if (m_imu_processor->initialize(package))
@@ -20,6 +24,10 @@ void MapBuilder::process(SyncPackage &package)
     if (m_status == BuilderStatus::MAP_INIT)
     {
         CloudType::Ptr cloud_world = LidarProcessor::transformCloud(package.cloud, m_lidar_processor->r_wl(), m_lidar_processor->t_wl());
+        if (cloud_world->empty())
+        {
+            return;
+        }
         m_lidar_processor->initCloudMap(cloud_world->points);
         m_status = BuilderStatus::MAPPING;
         return;
