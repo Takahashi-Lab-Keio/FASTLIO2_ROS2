@@ -14,8 +14,6 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-add_compile_definitions(SOPHUS_USE_BASIC_LOGGING)
-
 add_definitions(-DMP_EN)
 add_definitions(-DMP_PROC_NUM=2)
 
@@ -27,14 +25,12 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
 
 find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(Sophus REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 
@@ -49,11 +45,16 @@ set(SRC_LIST src/map_builder/commons.cpp
              src/map_builder/map_builder.cpp
              src/utils.cpp)
 
-add_executable(lio_node src/lio_node.cpp ${SRC_LIST})
-ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
+add_library(fastlio2_core ${SRC_LIST})
+target_include_directories(fastlio2_core PUBLIC src ${PCL_INCLUDE_DIRS})
+ament_target_dependencies(fastlio2_core std_msgs sensor_msgs pcl_conversions)
+target_link_libraries(fastlio2_core ${PCL_LIBRARIES})
+
+add_executable(lio_node src/lio_node.cpp)
+ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs pcl_conversions geometry_msgs)
 target_link_libraries(lio_node
+  fastlio2_core
   yaml-cpp
-  ${PCL_LIBRARIES}
 )
 
 
@@ -66,15 +67,22 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 
 if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
-  set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
+  find_package(ament_cmake_gtest REQUIRED)
+  # This fork runs focused regressions below. Normalizing all inherited upstream
+  # sources with ament_auto style tools is intentionally out of scope.
+
+  ament_add_gtest(test_pointcloud2_conversion test/test_pointcloud2_conversion.cpp)
+  target_link_libraries(test_pointcloud2_conversion fastlio2_core)
+  ament_target_dependencies(test_pointcloud2_conversion sensor_msgs)
+
+  ament_add_gtest(test_lidar_jacobian test/test_lidar_jacobian.cpp)
+  target_link_libraries(test_lidar_jacobian fastlio2_core)
+
+  ament_add_gtest(test_output_transforms test/test_output_transforms.cpp)
+  target_link_libraries(test_output_transforms fastlio2_core)
+
+  ament_add_gtest(test_so3_math test/test_so3_math.cpp)
+  target_link_libraries(test_so3_math fastlio2_core)
 endif()
 
 ament_package()

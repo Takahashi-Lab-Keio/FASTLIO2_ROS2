@@ -1,0 +1,73 @@
+# Hesai JT-128 + Castella
+imu_topic: /lidar_imu
+lidar_topic: /lidar_points
+lidar_frame: hesai_lidar
+imu_frame: hesai_lidar
+
+# FAST-LIO publishes fastlio_odom -> base_footprint. Do not run another
+# publisher for that same child frame in the mapping/localization process.
+world_frame: fastlio_odom
+body_frame: base_footprint
+publish_tf: true
+anchor_output_frame: true
+print_time_cost: false
+
+# HesaiLidar_ROS_2.0 publishes an unaligned FLOAT64 absolute-seconds field.
+point_time_field: timestamp
+point_time_mode: absolute_seconds
+require_point_time: true
+maximum_point_time_ms: 200.0
+maximum_imu_gap_seconds: 0.1
+maximum_lidar_gap_seconds: 1.0
+maximum_imu_queue_size: 4000
+maximum_lidar_queue_size: 20
+
+# The bundled and verified Hesai v2.0.11-derived driver publishes m/s^2 and
+# rad/s. Re-check both units before upgrading the driver.
+imu_acc_scale: 1.0
+
+# JT-128 produces 230400 points/frame in dual-return mode on this robot.
+lidar_filter_num: 6
+lidar_min_range: 0.5
+lidar_max_range: 60.0
+scan_resolution: 0.15
+map_resolution: 0.20
+
+cube_len: 300
+det_range: 50
+move_thresh: 1.5
+
+# Hesai's JT-128 FAST-LIO reference process-noise values.
+na: 0.1
+ng: 0.1
+nba: 0.0001
+nbg: 0.0001
+
+imu_init_num: 200
+# Reject raw-g, zero, or otherwise implausible startup acceleration before it
+# can corrupt gravity alignment. The robot must remain stationary here.
+imu_init_accel_min: 5.0
+imu_init_accel_max: 15.0
+near_search_num: 5
+ieskf_max_iter: 5
+
+gravity_align: true
+
+# Hesai's JT-128 reference configuration starts estimation at identity/zero;
+# these are not calibrated extrinsics. Freeze measured values after calibration.
+esti_il: true
+# p_imu = r_il * p_lidar + t_il
+r_il: [1.0, 0.0, 0.0,
+       0.0, 1.0, 0.0,
+       0.0, 0.0, 1.0]
+t_il: [0.0, 0.0, 0.0]
+
+# Castella URDF: p_base_footprint = r_bl * p_hesai_lidar + t_bl.
+# A fixed base-to-LiDAR mounting is used for output so online r_il/t_il
+# estimation cannot change the body-cloud mounting reference.
+r_bl: [0.0, 1.0, 0.0,
+      -1.0, 0.0, 0.0,
+       0.0, 0.0, 1.0]
+t_bl: [0.06125, 0.0, 0.728]
+
+lidar_cov_inv: 1000.0

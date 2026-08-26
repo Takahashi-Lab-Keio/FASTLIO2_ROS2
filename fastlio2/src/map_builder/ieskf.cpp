@@ -4,18 +4,18 @@ double State::gravity = 9.81;
 
 M3D Jr(const V3D &inp)
 {
-    return Sophus::SO3d::leftJacobian(inp).transpose();
+    return FastlioSo3::leftJacobian(inp).transpose();
 }
 M3D JrInv(const V3D &inp)
 {
-    return Sophus::SO3d::leftJacobianInverse(inp).transpose();
+    return FastlioSo3::leftJacobianInverse(inp).transpose();
 }
 
 void State::operator+=(const V21D &delta)
 {
-    r_wi *= Sophus::SO3d::exp(delta.segment<3>(0)).matrix();
+    r_wi *= FastlioSo3::exp(delta.segment<3>(0));
     t_wi += delta.segment<3>(3);
-    r_il *= Sophus::SO3d::exp(delta.segment<3>(6)).matrix();
+    r_il *= FastlioSo3::exp(delta.segment<3>(6));
     t_il += delta.segment<3>(9);
     v += delta.segment<3>(12);
     bg += delta.segment<3>(15);
@@ -25,9 +25,9 @@ void State::operator+=(const V21D &delta)
 V21D State::operator-(const State &other) const
 {
     V21D delta = V21D::Zero();
-    delta.segment<3>(0) = Sophus::SO3d(other.r_wi.transpose() * r_wi).log();
+    delta.segment<3>(0) = FastlioSo3::log(other.r_wi.transpose() * r_wi);
     delta.segment<3>(3) = t_wi - other.t_wi;
-    delta.segment<3>(6) = Sophus::SO3d(other.r_il.transpose() * r_il).log();
+    delta.segment<3>(6) = FastlioSo3::log(other.r_il.transpose() * r_il);
     delta.segment<3>(9) = t_il - other.t_il;
     delta.segment<3>(12) = v - other.v;
     delta.segment<3>(15) = bg - other.bg;
@@ -59,10 +59,10 @@ void IESKF::predict(const Input &inp, double dt, const M12D &Q)
     delta.segment<3>(12) = (m_x.r_wi * (inp.acc - m_x.ba) + m_x.g) * dt;
 
     m_F.setIdentity();
-    m_F.block<3, 3>(0, 0) = Sophus::SO3d::exp(-(inp.gyro - m_x.bg) * dt).matrix();
+    m_F.block<3, 3>(0, 0) = FastlioSo3::exp(-(inp.gyro - m_x.bg) * dt);
     m_F.block<3, 3>(0, 15) = -Jr((inp.gyro - m_x.bg) * dt) * dt;
     m_F.block<3, 3>(3, 12) = Eigen::Matrix3d::Identity() * dt;
-    m_F.block<3, 3>(12, 0) = -m_x.r_wi * Sophus::SO3d::hat(inp.acc - m_x.ba) * dt;
+    m_F.block<3, 3>(12, 0) = -m_x.r_wi * FastlioSo3::hat(inp.acc - m_x.ba) * dt;
     m_F.block<3, 3>(12, 18) = -m_x.r_wi * dt;
 
     m_G.setZero();

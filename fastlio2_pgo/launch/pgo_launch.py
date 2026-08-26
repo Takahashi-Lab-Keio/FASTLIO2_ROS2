@@ -7,14 +7,18 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    default_config = PathJoinSubstitution(
+    default_lio_config = PathJoinSubstitution(
         [FindPackageShare("fastlio2"), "config", "lio.yaml"]
     )
+    default_pgo_config = PathJoinSubstitution(
+        [FindPackageShare("fastlio2_pgo"), "config", "pgo.yaml"]
+    )
     default_rviz = PathJoinSubstitution(
-        [FindPackageShare("fastlio2"), "rviz", "fastlio2.rviz"]
+        [FindPackageShare("fastlio2_pgo"), "rviz", "pgo.rviz"]
     )
 
-    config_path = LaunchConfiguration("config_path")
+    lio_config = LaunchConfiguration("lio_config")
+    pgo_config = LaunchConfiguration("pgo_config")
     enable_rviz = LaunchConfiguration("enable_rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
@@ -23,14 +27,17 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "config_path",
-                default_value=default_config,
+                "lio_config",
+                default_value=default_lio_config,
                 description="FAST-LIO2 sensor and estimator YAML",
             ),
             DeclareLaunchArgument(
-                "enable_rviz",
-                default_value="true",
-                description="Start RViz2",
+                "pgo_config",
+                default_value=default_pgo_config,
+                description="Pose graph and map-saving YAML",
+            ),
+            DeclareLaunchArgument(
+                "enable_rviz", default_value="true", description="Start RViz2"
             ),
             DeclareLaunchArgument(
                 "rviz_config",
@@ -45,7 +52,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "publish_tf",
                 default_value="true",
-                description="Publish world_frame -> body_frame TF",
+                description="Publish fastlio_odom -> base_footprint TF",
             ),
             Node(
                 package="fastlio2",
@@ -55,16 +62,26 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
-                        "config_path": config_path,
+                        "config_path": lio_config,
                         "use_sim_time": use_sim_time,
                         "publish_tf": publish_tf,
                     }
                 ],
             ),
             Node(
+                package="fastlio2_pgo",
+                namespace="fastlio2/pgo",
+                executable="pgo_node",
+                name="pgo_node",
+                output="screen",
+                parameters=[
+                    {"config_path": pgo_config, "use_sim_time": use_sim_time}
+                ],
+            ),
+            Node(
                 package="rviz2",
                 executable="rviz2",
-                name="fastlio2_rviz",
+                name="fastlio2_mapping_rviz",
                 output="screen",
                 arguments=["-d", rviz_config],
                 parameters=[{"use_sim_time": use_sim_time}],
