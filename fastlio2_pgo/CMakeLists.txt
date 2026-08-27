@@ -26,13 +26,26 @@ find_package(message_filters REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
-find_package(GTSAM QUIET)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(fastlio2_interfaces REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
-
+# Ubuntu 24.04's libgtsam-dev exports a CppUnitLite target whose archive is
+# absent from the binary package. Loading GTSAMConfig.cmake therefore fails
+# before a consumer can link the otherwise usable public library. Discover the
+# stable C++ API directly so both the Ubuntu package and source installs work.
+find_path(GTSAM_INCLUDE_DIR
+  NAMES gtsam/nonlinear/ISAM2.h
+)
+find_library(GTSAM_LIBRARY
+  NAMES gtsam
+)
+if(GTSAM_INCLUDE_DIR AND GTSAM_LIBRARY)
+  set(GTSAM_FOUND TRUE)
+else()
+  set(GTSAM_FOUND FALSE)
+endif()
 
 include_directories(
   ${EIGEN3_INCLUDE_DIR}
@@ -46,9 +59,10 @@ add_executable(pgo_node src/pgo_node.cpp ${SRC_LIST})
 ament_target_dependencies(pgo_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs visualization_msgs fastlio2_interfaces)
 target_link_libraries(pgo_node ${PCL_LIBRARIES} yaml-cpp)
 if(GTSAM_FOUND)
+  target_include_directories(pgo_node PRIVATE ${GTSAM_INCLUDE_DIR})
   target_compile_definitions(pgo_node PRIVATE FASTLIO2_HAS_GTSAM)
-  target_link_libraries(pgo_node gtsam)
-  message(STATUS "GTSAM found: pose-graph loop closure is enabled")
+  target_link_libraries(pgo_node ${GTSAM_LIBRARY})
+  message(STATUS "GTSAM found at ${GTSAM_LIBRARY}: pose-graph loop closure is enabled")
 else()
   message(WARNING "GTSAM not found: mapping and map saving are enabled, but pose-graph loop closure is disabled")
 endif()

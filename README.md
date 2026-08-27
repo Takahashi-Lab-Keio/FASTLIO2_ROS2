@@ -47,6 +47,8 @@ source install/setup.bash
 
 Sophusは通常運用に不要です。GTSAMが見つかる場合はPGOのループ閉じ込みが有効になります。GTSAMがない場合も同じmapping launchでLIO地図の生成・保存は可能ですが、その場合の地図はLIO軌跡の積算で、回環補正は行いません。
 
+Ubuntu 24.04の`libgtsam-dev`は、同梱CMake exportがパッケージに存在しない`libCppUnitLite.a`を参照します。本リポジトリはこのexportを読み込まず、公開ヘッダと`libgtsam.so`を直接検出します。ビルド時に`GTSAM found at ...: pose-graph loop closure is enabled`と表示されることを確認してください。
+
 ## LIOのみを起動
 
 Hesaiドライバを先に起動してからLIOを起動し、初期化完了までロボットを少なくとも1秒静止させます。起動前だけ静止しても初期化sampleには入りません。
