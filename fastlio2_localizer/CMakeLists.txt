@@ -57,8 +57,17 @@ install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_icp_localizer test/test_icp_localizer.cpp)
   target_link_libraries(test_icp_localizer fastlio2_localizer_core)
+
+  ament_add_gtest(test_runtime_overrides test/test_runtime_overrides.cpp)
+  target_include_directories(test_runtime_overrides PRIVATE src)
+
+  ament_add_pytest_test(
+    test_localization_launch
+    test/test_localization_launch.py
+  )
 endif()
 
 ament_package()

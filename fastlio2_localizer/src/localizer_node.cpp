@@ -23,6 +23,7 @@
 #include "fastlio2_interfaces/srv/relocalize.hpp"
 #include "localizers/commons.h"
 #include "localizers/icp_localizer.h"
+#include "runtime_overrides.h"
 
 using namespace std::chrono_literals;
 
@@ -197,6 +198,17 @@ private:
             config["body_frame"].as<std::string>(m_config.body_frame);
         m_config.update_hz =
             config["update_hz"].as<double>(m_config.update_hz);
+
+        const std::string local_frame_override = declare_parameter<std::string>(
+            "local_frame_override", "");
+        m_config.local_frame = FastlioLocalizerRuntimeOverrides::selectFrame(
+            m_config.local_frame, local_frame_override);
+        if (!local_frame_override.empty())
+        {
+            RCLCPP_INFO(
+                get_logger(), "Overriding localizer local frame with '%s'",
+                m_config.local_frame.c_str());
+        }
 
         m_localizer_config.rough_scan_resolution =
             config["rough_scan_resolution"].as<double>();

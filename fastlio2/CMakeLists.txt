@@ -68,6 +68,7 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   # This fork runs focused regressions below. Normalizing all inherited upstream
   # sources with ament_auto style tools is intentionally out of scope.
 
@@ -83,6 +84,11 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_so3_math test/test_so3_math.cpp)
   target_link_libraries(test_so3_math fastlio2_core)
+
+  ament_add_gtest(test_runtime_overrides test/test_runtime_overrides.cpp)
+  target_include_directories(test_runtime_overrides PRIVATE src)
+
+  ament_add_pytest_test(test_lio_launch test/test_lio_launch.py)
 endif()
 
 ament_package()

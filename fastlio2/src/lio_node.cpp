@@ -24,6 +24,7 @@
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
 #include "output_transforms.h"
+#include "runtime_overrides.h"
 #include "utils.h"
 
 using namespace std::chrono_literals;
@@ -221,8 +222,16 @@ private:
         }
 
         // ROS parameter overrides take precedence over YAML; defaults come from YAML.
+        const std::string world_frame_override = declare_parameter<std::string>(
+            "world_frame_override", "");
+        m_node_config.world_frame = FastlioRuntimeOverrides::selectFrame(
+            m_node_config.world_frame, world_frame_override);
         m_node_config.require_point_time = declare_parameter<bool>(
             "require_point_time", m_node_config.require_point_time);
+        const bool allow_missing_point_time = declare_parameter<bool>(
+            "allow_missing_point_time", false);
+        m_node_config.require_point_time = FastlioRuntimeOverrides::requirePointTime(
+            m_node_config.require_point_time, allow_missing_point_time);
         m_node_config.anchor_output_frame = declare_parameter<bool>(
             "anchor_output_frame", m_node_config.anchor_output_frame);
         m_node_config.publish_tf = declare_parameter<bool>(
@@ -231,6 +240,20 @@ private:
             "imu_acc_scale", m_node_config.imu_acc_scale);
         m_node_config.maximum_point_time_ms = declare_parameter<double>(
             "maximum_point_time_ms", m_node_config.maximum_point_time_ms);
+
+        if (!world_frame_override.empty())
+        {
+            RCLCPP_INFO(
+                get_logger(), "Overriding FAST-LIO2 world frame with '%s'",
+                m_node_config.world_frame.c_str());
+        }
+        if (allow_missing_point_time)
+        {
+            RCLCPP_WARN(
+                get_logger(),
+                "Point time is optional; clouds without '%s' are treated as instantaneous scans",
+                m_node_config.point_time_field.c_str());
+        }
 
         if (m_node_config.imu_topic.empty() || m_node_config.lidar_topic.empty() ||
             m_node_config.body_frame.empty() || m_node_config.lidar_frame.empty() || m_node_config.imu_frame.empty() ||

@@ -21,6 +21,9 @@ def generate_launch_description():
         ),
         "use_sim_time": "false",
         "publish_tf": "true",
+        "world_frame_override": "",
+        "local_frame_override": "",
+        "allow_missing_point_time": "false",
         "initial_x": "0.0",
         "initial_y": "0.0",
         "initial_z": "0.0",
@@ -37,6 +40,11 @@ def generate_launch_description():
         "rviz_config": "RViz2 configuration file",
         "use_sim_time": "Use /clock instead of wall time",
         "publish_tf": "Publish fastlio_odom -> base_footprint TF",
+        "world_frame_override": "Override the LIO YAML world_frame when non-empty",
+        "local_frame_override": "Override the localizer YAML local_frame when non-empty",
+        "allow_missing_point_time": (
+            "Allow simulation PointCloud2 without a per-point time field"
+        ),
         "initial_x": "Initial map-frame x in metres",
         "initial_y": "Initial map-frame y in metres",
         "initial_z": "Initial map-frame z in metres",

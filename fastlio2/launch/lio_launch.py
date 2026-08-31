@@ -3,7 +3,26 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def _lio_node_parameters(
+    config_path,
+    use_sim_time,
+    publish_tf,
+    world_frame_override,
+    allow_missing_point_time,
+):
+    return {
+        "config_path": config_path,
+        "use_sim_time": use_sim_time,
+        "publish_tf": publish_tf,
+        "world_frame_override": world_frame_override,
+        "allow_missing_point_time": ParameterValue(
+            allow_missing_point_time, value_type=bool
+        ),
+    }
 
 
 def generate_launch_description():
@@ -19,6 +38,8 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
     publish_tf = LaunchConfiguration("publish_tf")
+    world_frame_override = LaunchConfiguration("world_frame_override")
+    allow_missing_point_time = LaunchConfiguration("allow_missing_point_time")
 
     return LaunchDescription(
         [
@@ -47,6 +68,18 @@ def generate_launch_description():
                 default_value="true",
                 description="Publish world_frame -> body_frame TF",
             ),
+            DeclareLaunchArgument(
+                "world_frame_override",
+                default_value="",
+                description="Override the YAML world_frame when non-empty",
+            ),
+            DeclareLaunchArgument(
+                "allow_missing_point_time",
+                default_value="false",
+                description=(
+                    "Allow simulation PointCloud2 without a per-point time field"
+                ),
+            ),
             Node(
                 package="fastlio2",
                 namespace="fastlio2",
@@ -54,11 +87,13 @@ def generate_launch_description():
                 name="lio_node",
                 output="screen",
                 parameters=[
-                    {
-                        "config_path": config_path,
-                        "use_sim_time": use_sim_time,
-                        "publish_tf": publish_tf,
-                    }
+                    _lio_node_parameters(
+                        config_path,
+                        use_sim_time,
+                        publish_tf,
+                        world_frame_override,
+                        allow_missing_point_time,
+                    )
                 ],
             ),
             Node(

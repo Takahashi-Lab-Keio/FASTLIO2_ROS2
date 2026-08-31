@@ -12,6 +12,8 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
     publish_tf = LaunchConfiguration("publish_tf")
+    world_frame_override = LaunchConfiguration("world_frame_override")
+    allow_missing_point_time = LaunchConfiguration("allow_missing_point_time")
 
     return LaunchDescription(
         [
@@ -42,6 +44,18 @@ def generate_launch_description():
                 default_value="true",
                 description="Publish fastlio_odom -> base_footprint TF",
             ),
+            DeclareLaunchArgument(
+                "world_frame_override",
+                default_value="",
+                description="Override the YAML world_frame when non-empty",
+            ),
+            DeclareLaunchArgument(
+                "allow_missing_point_time",
+                default_value="false",
+                description=(
+                    "Allow simulation PointCloud2 without a per-point time field"
+                ),
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     PathJoinSubstitution([package_share, "launch", "lio_launch.py"])
@@ -52,6 +66,8 @@ def generate_launch_description():
                     "rviz_config": rviz_config,
                     "use_sim_time": use_sim_time,
                     "publish_tf": publish_tf,
+                    "world_frame_override": world_frame_override,
+                    "allow_missing_point_time": allow_missing_point_time,
                 }.items(),
             )
         ]
