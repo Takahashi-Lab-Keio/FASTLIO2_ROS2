@@ -237,6 +237,22 @@ PointCloudConversionResult Utils::pointCloud2ToPCL(
         return result;
     }
 
+    const PointField *stride_field = findField(msg, "preprocessing_stride");
+    if (stride_field != nullptr)
+    {
+        if (!validateField(msg, "preprocessing_stride", PointField::UINT16,
+                           stride_field, result.error)) return result;
+        result.preprocessing_stride = readScalar<uint16_t>(msg.data.data(), stride_field->offset);
+        if (result.preprocessing_stride == 0 || time_field == nullptr)
+        {
+            result.error = "preprocessed clouds require positive stride and point timestamps";
+            return result;
+        }
+        // The producer already applied index decimation. Raw bags/simulation
+        // retain the configured lidar_filter_num; compact bags describe themselves.
+        filter_num = 1;
+    }
+
     const double header_time_seconds = getSec(msg.header);
     if (!std::isfinite(header_time_seconds))
     {
@@ -256,6 +272,14 @@ PointCloudConversionResult Utils::pointCloud2ToPCL(
         const size_t column = index % msg.width;
         const uint8_t *point =
             msg.data.data() + row * msg.row_step + column * msg.point_step;
+
+        if (stride_field != nullptr &&
+            readScalar<uint16_t>(point, stride_field->offset) != result.preprocessing_stride)
+        {
+            result.error = "inconsistent preprocessing_stride in PointCloud2";
+            result.cloud->clear();
+            return result;
+        }
 
         double offset_ms = 0.0;
         if (time_field != nullptr)

@@ -267,3 +267,42 @@ TEST(PointCloud2Conversion, RejectsMalformedStorage)
             "timestamp", "absolute_seconds")
             .success);
 }
+
+namespace {
+sensor_msgs::msg::PointCloud2 compactCloud() {
+    const double t = 1700000000.25;
+    auto raw = makeJt128Cloud({t, t+.02, t+.04, t+.09});
+    auto msg = raw;
+    msg.point_step = 28;
+    msg.row_step = msg.point_step*msg.width + 4;
+    msg.fields.push_back(field("preprocessing_stride",26,PointField::UINT16));
+    msg.data.resize(msg.row_step*msg.height);
+    for (size_t i=0;i<4;++i) {
+        std::memcpy(msg.data.data()+(i/2)*msg.row_step+(i%2)*28,
+                    raw.data.data()+(i/2)*raw.row_step+(i%2)*26,26);
+        writeScalar<uint16_t>(msg,i,26,6);
+    }
+    return msg;
+}
+}
+TEST(PointCloud2Conversion, CompactCloudSkipsSecondDecimationAndKeepsScanEnd) {
+    auto msg = compactCloud();
+    writeScalar<float>(msg,3,0,std::numeric_limits<float>::quiet_NaN());
+    auto result = Utils::pointCloud2ToPCL(msg,6);
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.cloud->size(),3U);
+    EXPECT_EQ(result.preprocessing_stride,6U);
+    EXPECT_NEAR(result.maximum_offset_ms,90,0.001);
+    EXPECT_NEAR(result.cloud->back().curvature,40,0.001);
+}
+TEST(PointCloud2Conversion, RejectsMalformedCompactMetadata) {
+    auto msg = compactCloud();
+    writeScalar<uint16_t>(msg,2,26,3);
+    EXPECT_FALSE(Utils::pointCloud2ToPCL(msg,6).success);
+    msg = compactCloud(); writeScalar<uint16_t>(msg,0,26,0);
+    EXPECT_FALSE(Utils::pointCloud2ToPCL(msg,6).success);
+    msg = compactCloud(); msg.fields.back().offset = 28;
+    EXPECT_FALSE(Utils::pointCloud2ToPCL(msg,6).success);
+    msg = compactCloud(); msg.fields.back().datatype = PointField::FLOAT32;
+    EXPECT_FALSE(Utils::pointCloud2ToPCL(msg,6).success);
+}

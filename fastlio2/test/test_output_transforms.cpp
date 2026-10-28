@@ -96,3 +96,28 @@ TEST(OutputTransforms, ClassifiesDuplicateAndResetTimestamps)
         FastlioTransforms::classifyTimestamp(10.2, 10.0, 0.5, 0.1),
         TimestampStatus::FATAL_FORWARD_GAP);
 }
+
+TEST(OutputTransforms, PlanarChainMatchesProjectionOfFullMapPose)
+{
+    using namespace FastlioTransforms;
+    const RigidPose offset{
+        (Eigen::AngleAxisd(0.4, V3D::UnitZ()) *
+         Eigen::AngleAxisd(-0.15, V3D::UnitY())).toRotationMatrix(), V3D(10, -5, 0.3)};
+    for (int i = 0; i < 100; ++i)
+    {
+        const RigidPose local{
+            (Eigen::AngleAxisd(i * 0.09, V3D::UnitZ()) *
+             Eigen::AngleAxisd(0.08, V3D::UnitX())).toRotationMatrix(),
+            V3D(i * 0.1, std::sin(i * 0.1), -0.12)};
+        const auto nav_local = planar(local);
+        const auto nav_offset = planarMapToOdom(offset, local);
+        const auto combined = compose(nav_offset, nav_local);
+        const auto expected = planar(compose(offset, local));
+        EXPECT_TRUE(combined.rotation.isApprox(expected.rotation, 1e-12));
+        EXPECT_TRUE(combined.translation.isApprox(expected.translation, 1e-12));
+        EXPECT_NEAR(combined.translation.z(), 0.0, 1e-12);
+        EXPECT_TRUE(combined.rotation.col(2).isApprox(V3D::UnitZ(), 1e-12));
+        EXPECT_NEAR(nav_local.translation.z(), 0.0, 1e-12);
+        EXPECT_NEAR(local.translation.z(), -0.12, 1e-12); // full 3D state unchanged
+    }
+}

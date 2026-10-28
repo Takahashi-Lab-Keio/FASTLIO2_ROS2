@@ -20,6 +20,8 @@ def generate_launch_description():
             [FindPackageShare("fastlio2_localizer"), "rviz", "localizer.rviz"]
         ),
         "use_sim_time": "false",
+        "nav2_mode": "false",
+        "nav2_planar": "true",
         "publish_tf": "true",
         "world_frame_override": "",
         "local_frame_override": "",
@@ -39,6 +41,8 @@ def generate_launch_description():
         "enable_rviz": "Start RViz2",
         "rviz_config": "RViz2 configuration file",
         "use_sim_time": "Use /clock instead of wall time",
+        "nav2_mode": "Enable IMU prediction and independent Nav2 TF bridge",
+        "nav2_planar": "Project Nav2 TF to x/y/yaw with z=0",
         "publish_tf": "Publish fastlio_odom -> base_footprint TF",
         "world_frame_override": "Override the LIO YAML world_frame when non-empty",
         "local_frame_override": "Override the localizer YAML local_frame when non-empty",

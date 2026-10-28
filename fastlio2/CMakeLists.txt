@@ -27,6 +27,8 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+find_package(fastlio2_interfaces REQUIRED)
 
 find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
@@ -51,14 +53,18 @@ ament_target_dependencies(fastlio2_core std_msgs sensor_msgs pcl_conversions)
 target_link_libraries(fastlio2_core ${PCL_LIBRARIES})
 
 add_executable(lio_node src/lio_node.cpp)
-ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs pcl_conversions geometry_msgs)
+ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs pcl_conversions geometry_msgs diagnostic_msgs)
 target_link_libraries(lio_node
   fastlio2_core
   yaml-cpp
 )
 
 
-install(TARGETS lio_node DESTINATION lib/${PROJECT_NAME})
+add_executable(nav_tf_node src/nav_tf_node.cpp)
+ament_target_dependencies(nav_tf_node rclcpp tf2_ros nav_msgs geometry_msgs diagnostic_msgs fastlio2_interfaces)
+target_link_libraries(nav_tf_node fastlio2_core)
+
+install(TARGETS lio_node nav_tf_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
@@ -82,6 +88,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_output_transforms test/test_output_transforms.cpp)
   target_link_libraries(test_output_transforms fastlio2_core)
 
+  ament_add_gtest(test_imu_predictor test/test_imu_predictor.cpp)
+  target_link_libraries(test_imu_predictor fastlio2_core)
+
   ament_add_gtest(test_so3_math test/test_so3_math.cpp)
   target_link_libraries(test_so3_math fastlio2_core)
 
@@ -89,6 +98,7 @@ if(BUILD_TESTING)
   target_include_directories(test_runtime_overrides PRIVATE src)
 
   ament_add_pytest_test(test_lio_launch test/test_lio_launch.py)
+  ament_add_pytest_test(test_prediction_nodes test/test_prediction_nodes.py TIMEOUT 90)
 endif()
 
 ament_package()

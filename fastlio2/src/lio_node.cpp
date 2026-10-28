@@ -7,9 +7,11 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -21,6 +23,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include "imu_predictor.h"
 #include "map_builder/commons.h"
 #include "map_builder/map_builder.h"
 #include "output_transforms.h"
@@ -78,6 +81,7 @@ struct StateData
         double start_time = 0.0;
         double end_time = 0.0;
         CloudType::Ptr cloud;
+        std::chrono::steady_clock::time_point received;
     };
     std::deque<LidarMeasurement> lidar_buffer;
     nav_msgs::msg::Path path;
@@ -130,9 +134,14 @@ public:
 
         const auto imu_qos = rclcpp::QoS(200).reliable().durability_volatile();
         const auto lidar_qos = rclcpp::QoS(10).reliable().durability_volatile();
+        // A separate executor owns this group. LiDAR deskewing, map updates and
+        // cloud serialization cannot occupy its executor thread.
+        m_imu_group = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+        rclcpp::SubscriptionOptions imu_options;
+        imu_options.callback_group = m_imu_group;
         m_imu_sub = create_subscription<sensor_msgs::msg::Imu>(
             m_node_config.imu_topic, imu_qos,
-            std::bind(&LIONode::imuCB, this, std::placeholders::_1));
+            std::bind(&LIONode::imuCB, this, std::placeholders::_1), imu_options);
         m_lidar_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
             m_node_config.lidar_topic, lidar_qos,
             std::bind(&LIONode::lidarCB, this, std::placeholders::_1));
@@ -141,12 +150,20 @@ public:
         m_world_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>("world_cloud", 10);
         m_path_pub = create_publisher<nav_msgs::msg::Path>("lio_path", 10);
         m_odom_pub = create_publisher<nav_msgs::msg::Odometry>("lio_odom", 10);
+        m_prediction_pub = create_publisher<nav_msgs::msg::Odometry>("predicted_odom", 10);
+        m_prediction_diag_pub = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+            "prediction/diagnostics", 10);
+        m_processing_diag_pub = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+            "processing/diagnostics", 20);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
         m_state_data.path.header.frame_id = m_node_config.world_frame;
         m_kf = std::make_shared<IESKF>();
         m_kf->setMaxIter(static_cast<size_t>(m_builder_config.ieskf_max_iter));
         m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
+        if (m_prediction_enabled)
+            m_prediction_timer = create_wall_timer(
+                10ms, std::bind(&LIONode::predictionCB, this), m_imu_group);
         m_timer = create_wall_timer(20ms, std::bind(&LIONode::timerCB, this));
 
         RCLCPP_INFO(
@@ -157,6 +174,8 @@ public:
             m_node_config.point_time_field.c_str(), m_node_config.point_time_mode.c_str(),
             m_node_config.imu_acc_scale);
     }
+
+    rclcpp::CallbackGroup::SharedPtr imuCallbackGroup() const { return m_imu_group; }
 
 private:
     void loadParameters()
@@ -232,10 +251,23 @@ private:
             "allow_missing_point_time", false);
         m_node_config.require_point_time = FastlioRuntimeOverrides::requirePointTime(
             m_node_config.require_point_time, allow_missing_point_time);
+        const auto body_override = declare_parameter<std::string>("body_frame_override", "");
+        if (!body_override.empty()) m_node_config.body_frame = body_override;
         m_node_config.anchor_output_frame = declare_parameter<bool>(
             "anchor_output_frame", m_node_config.anchor_output_frame);
         m_node_config.publish_tf = declare_parameter<bool>(
             "publish_tf", m_node_config.publish_tf);
+        m_prediction_enabled = declare_parameter<bool>("enable_imu_prediction", false);
+        ImuPredictor::Limits limits;
+        limits.max_imu_gap = m_node_config.maximum_imu_gap_seconds;
+        limits.max_samples = m_node_config.maximum_imu_queue_size;
+        limits.max_extrapolation = declare_parameter<double>("prediction_max_extrapolation", 0.05);
+        limits.max_correction_age = declare_parameter<double>("prediction_max_correction_age", 0.5);
+        if (!std::isfinite(limits.max_extrapolation) || limits.max_extrapolation <= 0.0 ||
+            limits.max_extrapolation > 0.1 || !std::isfinite(limits.max_correction_age) ||
+            limits.max_correction_age <= limits.max_extrapolation || limits.max_samples < 2)
+            throw std::runtime_error("invalid IMU prediction limits (extrapolation must be in (0, 0.1] s)");
+        m_predictor = std::make_unique<ImuPredictor>(limits);
         m_node_config.imu_acc_scale = declare_parameter<double>(
             "imu_acc_scale", m_node_config.imu_acc_scale);
         m_node_config.maximum_point_time_ms = declare_parameter<double>(
@@ -392,10 +424,42 @@ private:
             FastlioTransforms::scaleImuAcceleration(acceleration, m_node_config.imu_acc_scale),
             angular_velocity, timestamp);
         m_state_data.last_imu_time = timestamp;
+        if (m_prediction_enabled)
+        {
+            std::lock_guard<std::mutex> prediction_lock(m_prediction_mutex);
+            m_predictor->add(m_state_data.imu_buffer.back());
+        }
+    }
+
+    void processingDiagnostic(const std::string &stage, double stamp,
+        const std::vector<std::pair<std::string, double>> &values, bool error = false)
+    {
+        diagnostic_msgs::msg::DiagnosticArray output;
+        output.header.stamp = now();
+        diagnostic_msgs::msg::DiagnosticStatus status;
+        status.name = "fastlio2/processing";
+        status.hardware_id = m_node_config.lidar_frame;
+        status.level = error ? diagnostic_msgs::msg::DiagnosticStatus::WARN :
+                              diagnostic_msgs::msg::DiagnosticStatus::OK;
+        status.message = stage;
+        diagnostic_msgs::msg::KeyValue kv;
+        kv.key = "scan_start"; kv.value = std::to_string(stamp);
+        status.values.push_back(kv);
+        for (const auto &entry : values) {
+            kv.key = entry.first; kv.value = std::to_string(entry.second);
+            status.values.push_back(kv);
+        }
+        output.status.push_back(std::move(status));
+        m_processing_diag_pub->publish(output);
     }
 
     void lidarCB(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
+        const auto received = std::chrono::steady_clock::now();
+        const double receive_age_ms = (now().seconds() - Utils::getSec(msg->header)) * 1000;
+        const double receive_interval_ms = m_last_cloud_received == std::chrono::steady_clock::time_point{} ?
+            0.0 : std::chrono::duration<double, std::milli>(received - m_last_cloud_received).count();
+        m_last_cloud_received = received;
         if (msg->header.frame_id != m_node_config.lidar_frame)
         {
             RCLCPP_WARN_THROTTLE(
@@ -417,6 +481,8 @@ private:
             m_node_config.point_time_field, m_node_config.point_time_mode);
         if (!converted.success)
         {
+            processingDiagnostic("conversion_rejected: " + converted.error, timestamp,
+                {{"receive_age_ms", receive_age_ms}}, true);
             RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 2000,
                 "Dropping invalid PointCloud2: %s", converted.error.c_str());
@@ -455,10 +521,11 @@ private:
             return;
         }
         m_state_data.lidar_buffer.push_back(
-            {timestamp, timestamp + converted.maximum_offset_ms * 1e-3, converted.cloud});
+            {timestamp, timestamp + converted.maximum_offset_ms * 1e-3, converted.cloud, received});
         while (m_state_data.lidar_buffer.size() >
                m_node_config.maximum_lidar_queue_size)
         {
+            ++m_cloud_queue_drops;
             m_state_data.lidar_buffer.pop_front();
             m_state_data.lidar_pushed = false;
             RCLCPP_WARN_THROTTLE(
@@ -466,6 +533,17 @@ private:
                 "LiDAR queue reached its limit; dropping oldest scans while waiting for IMU");
         }
         m_state_data.last_lidar_time = timestamp;
+        processingDiagnostic("received", timestamp, {
+            {"receive_age_ms", receive_age_ms}, {"receive_interval_ms", receive_interval_ms},
+            {"scan_end_age_ms", receive_age_ms - converted.maximum_offset_ms},
+            {"conversion_ms", std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - received).count()},
+            {"input_points", double(msg->width) * msg->height},
+            {"input_bytes", double(msg->data.size())},
+            {"usable_points", double(converted.cloud->size())},
+            {"preprocessing_stride", converted.preprocessing_stride},
+            {"queue_depth", double(m_state_data.lidar_buffer.size())},
+            {"queue_drops", double(m_cloud_queue_drops)}});
     }
 
     bool syncPackage()
@@ -497,6 +575,7 @@ private:
         }
         if (m_state_data.last_imu_time < m_package.cloud_end_time)
         {
+            ++m_imu_wait_ticks;
             return false;
         }
 
@@ -507,6 +586,8 @@ private:
             m_package.imus.emplace_back(m_state_data.imu_buffer.front());
             m_state_data.imu_buffer.pop_front();
         }
+        m_processing_queue_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - m_state_data.lidar_buffer.front().received).count();
         m_state_data.lidar_buffer.pop_front();
         m_state_data.lidar_pushed = false;
         if (m_package.imus.empty())
@@ -642,13 +723,106 @@ private:
         m_tf_broadcaster->sendTransform(transform);
     }
 
+    void predictionCB()
+    {
+        const auto started = std::chrono::steady_clock::now();
+        const auto stamp = now();
+        const double time = stamp.seconds();
+        if (time < m_last_prediction_time - 0.5)
+        {
+            RCLCPP_FATAL(get_logger(), "ROS clock regressed; restart FAST-LIO before replaying a reset clock");
+            rclcpp::shutdown();
+            return;
+        }
+        if (time <= m_last_prediction_time) return;  // paused /clock
+        State predicted;
+        FastlioTransforms::RigidPose anchor;
+        V3D omega = V3D::Zero();
+        double imu_time, correction_time;
+        size_t replay_steps;
+        std::string reason;
+        bool valid;
+        {
+            std::lock_guard<std::mutex> lock(m_prediction_mutex);
+            valid = m_predictor->predict(time, predicted, reason);
+            if (valid) omega = m_predictor->angularVelocity(predicted);
+            imu_time = m_predictor->imuTime();
+            correction_time = m_predictor->correctionTime();
+            replay_steps = m_predictor->replaySteps();
+            anchor = m_prediction_anchor;
+        }
+        if (valid)
+        {
+            const auto base = m_node_config.use_base_lidar_extrinsic
+                ? FastlioTransforms::lidarPoseToBasePose(
+                    predicted.r_wi, predicted.t_wi, predicted.r_il, predicted.t_il,
+                    m_node_config.r_bl, m_node_config.t_bl)
+                : FastlioTransforms::imuPoseToBasePose(
+                    predicted.r_wi, predicted.t_wi, m_node_config.r_bi, m_node_config.t_bi);
+            const auto output = FastlioTransforms::compose(anchor, base);
+            const Eigen::Quaterniond q(output.rotation);
+            nav_msgs::msg::Odometry odom;
+            odom.header.stamp = stamp;
+            odom.header.frame_id = m_node_config.world_frame;
+            odom.child_frame_id = m_node_config.body_frame;
+            odom.pose.pose.position.x = output.translation.x();
+            odom.pose.pose.position.y = output.translation.y();
+            odom.pose.pose.position.z = output.translation.z();
+            odom.pose.pose.orientation.x = q.x();
+            odom.pose.pose.orientation.y = q.y();
+            odom.pose.pose.orientation.z = q.z();
+            odom.pose.pose.orientation.w = q.w();
+            // Include the velocity of the base origin caused by the IMU lever arm.
+            const V3D omega_world = predicted.r_wi * omega;
+            const V3D v_base = base.rotation.transpose() *
+                (predicted.v + omega_world.cross(base.translation - predicted.t_wi));
+            const V3D omega_base = base.rotation.transpose() * omega_world;
+            odom.twist.twist.linear.x = v_base.x();
+            odom.twist.twist.linear.y = v_base.y();
+            odom.twist.twist.linear.z = v_base.z();
+            odom.twist.twist.angular.x = omega_base.x();
+            odom.twist.twist.angular.y = omega_base.y();
+            odom.twist.twist.angular.z = omega_base.z();
+            m_prediction_pub->publish(odom);
+            m_last_prediction_time = time;
+        }
+        // Diagnostics continue during input dropout, but TF / odometry do not.
+        if (time - m_last_prediction_diag_time >= 0.1 || reason != m_last_prediction_reason)
+        {
+            diagnostic_msgs::msg::DiagnosticArray diag;
+            diag.header.stamp = stamp;
+            diagnostic_msgs::msg::DiagnosticStatus status;
+            status.name = get_fully_qualified_name() + std::string("/imu_prediction");
+            status.hardware_id = m_node_config.imu_frame;
+            status.level = valid ? status.OK : status.WARN;
+            status.message = reason;
+            const auto value = [&status](const std::string &key, double number) {
+                diagnostic_msgs::msg::KeyValue entry;
+                entry.key = key;
+                entry.value = std::to_string(number);
+                status.values.push_back(entry);
+            };
+            value("imu_stamp", imu_time);
+            value("correction_stamp", correction_time);
+            value("imu_age_seconds", time - imu_time);
+            value("correction_age_seconds", time - correction_time);
+            value("replayed_imu_samples", replay_steps);
+            value("processing_ms", std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count());
+            diag.status.push_back(status);
+            m_prediction_diag_pub->publish(diag);
+            m_last_prediction_diag_time = time;
+            m_last_prediction_reason = reason;
+        }
+    }
+
     void timerCB()
     {
         if (!syncPackage())
         {
             return;
         }
-        const auto start = std::chrono::high_resolution_clock::now();
+        const auto start = std::chrono::steady_clock::now();
         try
         {
             m_builder->process(m_package);
@@ -660,19 +834,38 @@ private:
             rclcpp::shutdown();
             return;
         }
-        const auto finish = std::chrono::high_resolution_clock::now();
+        const auto finish = std::chrono::steady_clock::now();
         if (m_node_config.print_time_cost)
         {
             const double milliseconds =
                 std::chrono::duration_cast<std::chrono::duration<double>>(finish - start).count() * 1000.0;
             RCLCPP_INFO(get_logger(), "Processing time: %.2f ms", milliseconds);
         }
+        const double estimator_ms = std::chrono::duration<double, std::milli>(finish - start).count();
+        const auto emit_processing = [&](const std::string &stage) {
+            processingDiagnostic(stage, m_package.cloud_start_time, {
+                {"scan_end", m_package.cloud_end_time},
+                {"scan_end_age_ms", (now().seconds() - m_package.cloud_end_time) * 1000},
+                {"queue_wait_ms", m_processing_queue_ms},
+                {"imu_wait_ticks_total", double(m_imu_wait_ticks)},
+                {"estimator_ms", estimator_ms},
+                {"output_ms", std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - finish).count()},
+                {"queue_drops", double(m_cloud_queue_drops)}});
+        };
         if (m_builder->status() != BuilderStatus::MAPPING)
         {
+            emit_processing("initializing");
             return;
         }
 
         initializeOutputAnchor();
+        if (m_prediction_enabled)
+        {
+            std::lock_guard<std::mutex> lock(m_prediction_mutex);
+            m_prediction_anchor = {m_state_data.r_ow, m_state_data.t_ow};
+            m_predictor->correct(m_kf->x(), m_package.cloud_end_time);
+        }
         if (m_node_config.publish_tf)
         {
             broadcastTF(m_package.cloud_end_time);
@@ -697,6 +890,7 @@ private:
             LidarProcessor::transformCloud(m_package.cloud, r_ol, t_ol);
         publishCloud(m_world_cloud_pub, world_cloud, m_node_config.world_frame, m_package.cloud_end_time);
         publishPath(m_package.cloud_end_time);
+        emit_processing("processed");
     }
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_lidar_sub;
@@ -706,6 +900,21 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_path_pub;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
     rclcpp::TimerBase::SharedPtr m_timer;
+    rclcpp::CallbackGroup::SharedPtr m_imu_group;
+    rclcpp::TimerBase::SharedPtr m_prediction_timer;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_prediction_pub;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr m_prediction_diag_pub;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr m_processing_diag_pub;
+    std::chrono::steady_clock::time_point m_last_cloud_received{};
+    double m_processing_queue_ms = 0.0;
+    uint64_t m_cloud_queue_drops = 0, m_imu_wait_ticks = 0;
+    std::mutex m_prediction_mutex;
+    std::unique_ptr<ImuPredictor> m_predictor;
+    FastlioTransforms::RigidPose m_prediction_anchor;
+    bool m_prediction_enabled = false;
+    double m_last_prediction_time = -std::numeric_limits<double>::infinity();
+    double m_last_prediction_diag_time = -std::numeric_limits<double>::infinity();
+    std::string m_last_prediction_reason;
     StateData m_state_data;
     SyncPackage m_package;
     NodeConfig m_node_config;
@@ -718,7 +927,13 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LIONode>());
+    const auto node = std::make_shared<LIONode>();
+    rclcpp::executors::SingleThreadedExecutor imu_executor;
+    imu_executor.add_callback_group(node->imuCallbackGroup(), node->get_node_base_interface());
+    std::thread imu_thread([&imu_executor]() { imu_executor.spin(); });
+    rclcpp::spin(node);
+    imu_executor.cancel();
+    imu_thread.join();
     rclcpp::shutdown();
     return 0;
 }

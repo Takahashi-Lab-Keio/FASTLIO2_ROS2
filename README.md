@@ -135,13 +135,49 @@ ros2 service call /fastlio2/localizer/relocalize_check \
 
 LiDARと内蔵IMU間は`r_il=I`、`t_il=0`を初期値とし、`esti_il: true`で推定します。これはHesai公式サンプルで使われる推定開始値であり、実機校正済みの外部パラメータではありません。公式に確認できるのはLiDARと内蔵IMUの軸に回転差がないことまでで、並進は未確定です。高精度運用前には実機データで外部パラメータを校正し、必要に応じて推定値を固定してください。
 
-TFの所有関係は次のとおりです。
+既定の `nav2_mode:=false` でのTF所有関係は次のとおりです。
 
 ```text
 map -> fastlio_odom -> base_footprint
 ```
 
-同じ子frameへ別のTFを同時配信しないでください。CastellaのNSK odometryは通常`odom -> base_footprint`を配信するため、そのままFAST-LIOのTFと併用すると`base_footprint`が二重親になります。Hesaiなどのbringup機能を併用してFAST-LIOをTFの所有者にする場合は、Castella側を`publish_odom_tf:=false`で起動してください。反対に既存システム側をTFの所有者にする場合はFAST-LIO launchへ`publish_tf:=false`を指定します。どちらの場合も、Nav2が使用するodom frame/topicの切替はこのリポジトリでは自動実行しません。
+同じ子frameへ別のTFを同時配信しないでください。CastellaのNSK odometryは通常`odom -> base_footprint`を配信するため、そのままFAST-LIOのTFと併用すると`base_footprint`が二重親になります。Hesaiなどのbringup機能を併用してFAST-LIOをTFの所有者にする場合は、Castella側を`publish_odom_tf:=false`で起動してください。反対に既存システム側をTFの所有者にする場合はFAST-LIO launchへ`publish_tf:=false`を指定します。既定モードでは、Nav2が使用するodom frame/topicの切替は自動実行しません。下記の `nav2_mode` は別途明示して有効化します。
+
+## Nav2向けIMU予測・平面TF（オプション）
+
+```bash
+ros2 launch fastlio2_localizer jt128_localization.launch.py \
+  map_path:=/absolute/path/map.pcd nav2_mode:=true enable_rviz:=false
+```
+
+`nav2_mode:=true` はLIOとICPの直接TF配信を止め、独立した `nav_tf_node` に集約します。
+LIOのIMU受信・予測は専用executorで動作し、LiDAR補正後のIMU履歴を再積分します。
+現在ROS時刻までの予測を100 Hzで公開し、最後のIMUからの積分は最大50 ms、
+最後のLiDAR補正からは最大500 msです。期限超過時は古い姿勢を再配信せず停止します。
+この方式の構成は [LIO-SAM](https://github.com/TixiaoShan/LIO-SAM/blob/0be1fbe6275fb8366d5b800af4fc8c76a885c869/src/imuPreintegration.cpp#L406-L505)
+および [FAST-LIVO2](https://github.com/hku-mars/FAST-LIVO2/blob/0d2c0346107b75b59934975adec9a6eeeb913c64/src/LIVMapper.cpp#L556-L634)
+の補正後IMU再積分を参考にし、状態方程式はこの実装のIESKFと共通化しています。
+
+TFは `map -> odom -> base_footprint`（平面）と
+`map -> fastlio_odom -> fastlio_body`（3次元）の2枝です。
+このモードではLIO/localizerのframe overrideをこれらの専用フレームに置き換えます。
+地図照合は元の3次元の `lio_odom` / `body_cloud` を使います。
+平面化は平坦な床のNav2向けで、斜面上の実際の車体傾斜は表現しません。
+`nav2_planar:=false` で平面化だけを無効化できます。
+
+平面TFは合成後のmap姿勢を射影し、
+`T_map_odom = P(T_map_local * T_local_body) * inverse(P(T_local_body))`
+として地図座標の傾きにも対応します。z=0、roll=pitch=0が既定です。
+`nav_tf_node.base_height` で固定zを変更できます。
+再初期化中は `fastlio2_interfaces/LocalizationState.valid=false` を配信し、
+map補正のTF更新を止めます。ICP不収束時は従来どおり最後の成功補正を保持します。
+
+追加出力は `/fastlio2/predicted_odom`、`/fastlio2/nav_odom`、
+`/fastlio2/prediction/diagnostics`、`/fastlio2/nav_tf/diagnostics`、
+`/fastlio2/localizer/localization_state` です。
+`predicted_odom` の共分散は未対応、`nav_odom` は姿勢観測専用です。
+制御器用の速度トピックはこのlaunchでは切り替えません。
+Castella側の起動は引き続きNSKの `/odom` を速度入力に使い、NSKのTFは無効にします。
 
 ## タイムスタンプと地図品質
 

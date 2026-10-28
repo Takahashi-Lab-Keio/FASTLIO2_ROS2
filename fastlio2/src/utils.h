@@ -26,6 +26,7 @@ struct PointCloudConversionResult
     bool success = false;
     std::string error;
     double maximum_offset_ms = 0.0;
+    uint16_t preprocessing_stride = 0;  // zero: raw cloud, apply lidar_filter_num
 };
 
 class Utils

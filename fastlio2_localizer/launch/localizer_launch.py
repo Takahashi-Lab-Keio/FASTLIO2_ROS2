@@ -1,10 +1,27 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def _nav_override(nav2_mode, enabled, disabled):
+    if isinstance(nav2_mode, str):
+        return enabled if nav2_mode.lower() == "true" else disabled
+    return PythonExpression([
+        "'", str(enabled), "' if '", nav2_mode,
+        "'.lower() == 'true' else '", disabled, "'",
+    ])
+
+
+def _bool_parameter(value):
+    if isinstance(value, str):
+        if value.lower() not in ("true", "false"):
+            raise ValueError("Expected true or false")
+        value = value.lower() == "true"
+    return ParameterValue(value, value_type=bool)
 
 
 def _lio_node_parameters(
@@ -13,12 +30,15 @@ def _lio_node_parameters(
     publish_tf,
     world_frame_override,
     allow_missing_point_time,
+    nav2_mode="false",
 ):
     return {
         "config_path": config_path,
         "use_sim_time": use_sim_time,
-        "publish_tf": publish_tf,
-        "world_frame_override": world_frame_override,
+        "publish_tf": _bool_parameter(_nav_override(nav2_mode, "false", publish_tf)),
+        "enable_imu_prediction": _bool_parameter(nav2_mode),
+        "world_frame_override": _nav_override(nav2_mode, "fastlio_odom", world_frame_override),
+        "body_frame_override": _nav_override(nav2_mode, "fastlio_body", ""),
         "allow_missing_point_time": ParameterValue(
             allow_missing_point_time, value_type=bool
         ),
@@ -32,6 +52,7 @@ def _localizer_node_parameters(
     use_sim_time,
     local_frame_override,
     initial_values,
+    nav2_mode="false",
 ):
     return {
         "config_path": config_path,
@@ -40,7 +61,9 @@ def _localizer_node_parameters(
             initialize_from_parameters, value_type=bool
         ),
         "use_sim_time": use_sim_time,
-        "local_frame_override": local_frame_override,
+        "local_frame_override": _nav_override(nav2_mode, "fastlio_odom", local_frame_override),
+        "body_frame_override": _nav_override(nav2_mode, "fastlio_body", ""),
+        "publish_tf": _bool_parameter(_nav_override(nav2_mode, "false", "true")),
         **initial_values,
     }
 
@@ -70,6 +93,9 @@ def generate_launch_description():
     local_frame_override = LaunchConfiguration("local_frame_override")
     allow_missing_point_time = LaunchConfiguration("allow_missing_point_time")
 
+    nav2_mode = LaunchConfiguration("nav2_mode")
+    nav2_planar = LaunchConfiguration("nav2_planar")
+
     initial_names = [
         "initial_x",
         "initial_y",
@@ -84,6 +110,10 @@ def generate_launch_description():
     }
 
     declarations = [
+        DeclareLaunchArgument("nav2_mode", default_value="false",
+                              description="Use IMU prediction and the independent Nav2 TF bridge"),
+        DeclareLaunchArgument("nav2_planar", default_value="true",
+                              description="Project Nav2 TF to x/y/yaw with z=0; preserve full 3D outputs"),
         DeclareLaunchArgument(
             "lio_config",
             default_value=default_lio_config,
@@ -161,6 +191,7 @@ def generate_launch_description():
                         publish_tf,
                         world_frame_override,
                         allow_missing_point_time,
+                        nav2_mode,
                     )
                 ],
             ),
@@ -178,8 +209,21 @@ def generate_launch_description():
                         use_sim_time,
                         local_frame_override,
                         initial_values,
+                        nav2_mode,
                     )
                 ],
+            ),
+            Node(
+                package="fastlio2",
+                namespace="fastlio2",
+                executable="nav_tf_node",
+                name="nav_tf_node",
+                output="screen",
+                parameters=[{
+                    "use_sim_time": use_sim_time,
+                    "planar": ParameterValue(nav2_planar, value_type=bool),
+                }],
+                condition=IfCondition(nav2_mode),
             ),
             Node(
                 package="rviz2",

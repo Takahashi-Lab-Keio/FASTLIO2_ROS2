@@ -60,6 +60,22 @@ inline RigidPose inverse(const RigidPose &pose)
     return {inverse_rotation, -inverse_rotation * pose.translation};
 }
 
+// Project the composed pose, not each component independently: projection to
+// SE(2) does not commute with SE(3) composition (especially with a tilted map).
+inline RigidPose planar(const RigidPose &pose, double height = 0.0)
+{
+    const double yaw = std::atan2(pose.rotation(1, 0), pose.rotation(0, 0));
+    return {Eigen::AngleAxisd(yaw, V3D::UnitZ()).toRotationMatrix(),
+            V3D(pose.translation.x(), pose.translation.y(), height)};
+}
+
+inline RigidPose planarMapToOdom(
+    const RigidPose &map_to_local, const RigidPose &local_to_base, double height = 0.0)
+{
+    return compose(planar(compose(map_to_local, local_to_base), height),
+                   inverse(planar(local_to_base, height)));
+}
+
 // T_world_base = T_world_imu * inverse(T_base_imu).
 inline RigidPose imuPoseToBasePose(
     const M3D &r_wi, const V3D &t_wi, const M3D &r_bi, const V3D &t_bi)

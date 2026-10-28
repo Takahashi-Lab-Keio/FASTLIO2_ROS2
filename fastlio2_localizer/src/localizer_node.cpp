@@ -19,6 +19,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <yaml-cpp/yaml.h>
 
+#include "fastlio2_interfaces/msg/localization_state.hpp"
 #include "fastlio2_interfaces/srv/is_valid.hpp"
 #include "fastlio2_interfaces/srv/relocalize.hpp"
 #include "localizers/commons.h"
@@ -49,6 +50,7 @@ struct NodeState
     bool localize_success = false;
     double last_update_seconds = -std::numeric_limits<double>::infinity();
     builtin_interfaces::msg::Time last_message_time;
+    builtin_interfaces::msg::Time last_correction_time;
     CloudType::Ptr last_cloud = std::make_shared<CloudType>();
     M3D last_r = M3D::Identity();         // T_local_body rotation
     V3D last_t = V3D::Zero();             // T_local_body translation
@@ -127,6 +129,9 @@ public:
         m_pose_pub = create_publisher<geometry_msgs::msg::PoseStamped>(
             "pose", rclcpp::QoS(10).reliable());
 
+        m_localization_pub = create_publisher<fastlio2_interfaces::msg::LocalizationState>(
+            "localization_state", rclcpp::QoS(1).reliable().transient_local());
+        m_localization_pub->publish(fastlio2_interfaces::msg::LocalizationState{});
         m_timer = create_wall_timer(10ms, std::bind(&LocalizerNode::timerCB, this));
 
         if (!m_startup_map_path.empty())
@@ -199,6 +204,9 @@ private:
         m_config.update_hz =
             config["update_hz"].as<double>(m_config.update_hz);
 
+        m_publish_tf = declare_parameter<bool>("publish_tf", true);
+        const auto body_override = declare_parameter<std::string>("body_frame_override", "");
+        if (!body_override.empty()) m_config.body_frame = body_override;
         const std::string local_frame_override = declare_parameter<std::string>(
             "local_frame_override", "");
         m_config.local_frame = FastlioLocalizerRuntimeOverrides::selectFrame(
@@ -330,6 +338,8 @@ private:
         m_state.initial_guess = guess;
         m_state.service_received = true;
         m_state.localize_success = false;
+        // One atomic message invalidates both the map correction and its state.
+        m_localization_pub->publish(fastlio2_interfaces::msg::LocalizationState{});
     }
 
     void timerCB()
@@ -405,6 +415,7 @@ private:
                 m_state.last_offset_t =
                     map_body_t -
                     m_state.last_offset_r * current_local_t;
+                m_state.last_correction_time = current_time;
             }
             if (request_pending)
             {
@@ -590,7 +601,12 @@ private:
         transform.transform.rotation.y = quaternion.y();
         transform.transform.rotation.z = quaternion.z();
         transform.transform.rotation.w = quaternion.w();
-        m_tf_broadcaster->sendTransform(transform);
+        if (m_publish_tf) m_tf_broadcaster->sendTransform(transform);
+        fastlio2_interfaces::msg::LocalizationState state;
+        state.valid = true;
+        state.map_to_local = transform;
+        state.map_to_local.header.stamp = m_state.last_correction_time;
+        m_localization_pub->publish(state);
     }
 
     void publishPose(
@@ -692,6 +708,8 @@ private:
         m_map_cloud_pub->publish(map_cloud_msg);
     }
 
+    bool m_publish_tf = true;
+    rclcpp::Publisher<fastlio2_interfaces::msg::LocalizationState>::SharedPtr m_localization_pub;
     NodeConfig m_config;
     NodeState m_state;
     ICPConfig m_localizer_config;

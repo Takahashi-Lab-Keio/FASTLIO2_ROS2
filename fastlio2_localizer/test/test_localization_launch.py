@@ -40,6 +40,8 @@ def test_generic_launch_preserves_defaults_and_forwards_both_frames():
         "world_frame_override": "",
         "local_frame_override": "",
         "allow_missing_point_time": "false",
+        "nav2_mode": "false",
+        "nav2_planar": "true",
     }.items():
         assert _default(declarations[name]) == default
 
@@ -75,6 +77,29 @@ def test_jt128_wrapper_declares_and_forwards_runtime_overrides():
         "world_frame_override": "",
         "local_frame_override": "",
         "allow_missing_point_time": "false",
+        "nav2_mode": "false",
+        "nav2_planar": "true",
     }.items():
         assert _default(declarations[name]) == default
         assert name in forwarded
+
+
+def test_nav_mode_has_one_tf_owner_and_separate_3d_frames():
+    from launch.substitutions import LaunchConfiguration
+    module = _load_launch("localizer_launch.py", "fastlio2_nav_localization_launch")
+    context = LaunchContext()
+    context.launch_configurations["nav2_mode"] = "true"
+    mode = LaunchConfiguration("nav2_mode")
+    lio = module._lio_node_parameters("lio.yaml", "false", "true", "odom", False, mode)
+    localizer = module._localizer_node_parameters("loc.yaml", "map.pcd", False, "false", "odom", {}, mode)
+    assert lio["enable_imu_prediction"].evaluate(context) is True
+    assert lio["publish_tf"].evaluate(context) is False
+    assert localizer["publish_tf"].evaluate(context) is False
+    assert lio["world_frame_override"].perform(context) == "fastlio_odom"
+    assert localizer["local_frame_override"].perform(context) == "fastlio_odom"
+    assert lio["body_frame_override"].perform(context) == "fastlio_body"
+    assert localizer["body_frame_override"].perform(context) == "fastlio_body"
+    context.launch_configurations["nav2_mode"] = "false"
+    lio = module._lio_node_parameters("lio.yaml", "false", "true", "odom", False, mode)
+    assert lio["publish_tf"].evaluate(context) is True
+    assert lio["world_frame_override"].perform(context) == "odom"
