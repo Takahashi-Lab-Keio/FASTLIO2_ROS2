@@ -19,6 +19,9 @@ require_point_time: true
 maximum_point_time_ms: 200.0
 maximum_imu_gap_seconds: 0.1
 maximum_lidar_gap_seconds: 1.0
+# Keep initialization restartable through the all-node startup load. No poses
+# or TF are published until both streams cover this continuous time span.
+startup_continuous_input_seconds: 5.0
 maximum_imu_queue_size: 4000
 maximum_lidar_queue_size: 20
 

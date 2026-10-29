@@ -49,6 +49,27 @@ TEST(ImuPredictor, MainFilterDynamicsRemainNumericallyUnchanged)
     expectState(filter.x(), legacy);
 }
 
+TEST(ImuPredictor, StartupResetRequiresEntirelyNewHistoryAndCorrection)
+{
+    ImuPredictor predictor(testLimits());
+    State state, result;
+    std::string reason;
+    predictor.add(sample(10.0));
+    predictor.add(sample(10.01));
+    ASSERT_TRUE(predictor.correct(state, 10.005));
+    ASSERT_TRUE(predictor.predict(10.02, result, reason));
+    predictor.reset();
+    EXPECT_FALSE(predictor.predict(10.02, result, reason));
+    EXPECT_FALSE(predictor.correct(state, 10.005));
+    predictor.add(sample(11.0));
+    predictor.add(sample(11.01));
+    EXPECT_FALSE(predictor.correct(state, 10.005));
+    EXPECT_FALSE(predictor.predict(11.02, result, reason));
+    ASSERT_TRUE(predictor.correct(state, 11.005));
+    EXPECT_TRUE(predictor.predict(11.02, result, reason));
+    EXPECT_EQ(predictor.replaySteps(), 1U);
+}
+
 TEST(ImuPredictor, DelayedCorrectionReplaysWithNewBiasesAndPartialInterval)
 {
     ImuPredictor predictor(testLimits());

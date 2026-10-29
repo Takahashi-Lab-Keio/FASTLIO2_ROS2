@@ -23,6 +23,15 @@ public:
 
     explicit ImuPredictor(Limits limits) : limits_(limits) {}
 
+    void reset()
+    {
+        samples_.clear();
+        ready_ = false;
+        state_time_ = 0.0;
+        correction_time_ = -std::numeric_limits<double>::infinity();
+        replay_steps_ = 0;
+    }
+
     bool add(const IMUData &sample)
     {
         if (!std::isfinite(sample.time) || !sample.acc.allFinite() ||

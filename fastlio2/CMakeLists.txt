@@ -99,6 +99,7 @@ if(BUILD_TESTING)
 
   ament_add_pytest_test(test_lio_launch test/test_lio_launch.py)
   ament_add_pytest_test(test_prediction_nodes test/test_prediction_nodes.py TIMEOUT 90)
+  ament_add_pytest_test(test_startup_gaps test/test_startup_gaps.py TIMEOUT 120)
 endif()
 
 ament_package()

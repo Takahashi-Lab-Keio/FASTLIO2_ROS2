@@ -22,7 +22,7 @@ from tf2_msgs.msg import TFMessage
 
 
 @contextlib.contextmanager
-def ros_nodes(tmp_path, executables):
+def ros_nodes(tmp_path, executables, expect_exit=False):
     # No hardware launch, map server, controller or velocity publisher is used.
     os.environ['ROS_DOMAIN_ID'] = '193'
     os.environ['ROS_LOCALHOST_ONLY'] = '1'
@@ -41,7 +41,10 @@ def ros_nodes(tmp_path, executables):
                 [str(path), '--ros-args', '-r', '__ns:=/fastlio2', *arguments],
                 stdout=log, stderr=subprocess.STDOUT))
         yield probe
-        assert all(p.poll() is None for p in processes), [p.returncode for p in processes]
+        if expect_exit:
+            assert all(p.wait(timeout=5) == 0 for p in processes)
+        else:
+            assert all(p.poll() is None for p in processes), [p.returncode for p in processes]
     finally:
         for p in processes:
             if p.poll() is None:
@@ -123,6 +126,7 @@ def test_tf_projection_invalidation_and_no_retimestamping(tmp_path):
 def test_real_lio_node_predicts_past_delayed_scans_and_stops_on_dropout(tmp_path, compact):
     config = Path(__file__).resolve().parents[1] / 'config/jt128.yaml'
     args = ['-p', f'config_path:={config}', '-p', 'allow_missing_point_time:=true',
+            '-p', 'startup_continuous_input_seconds:=0.0',
             '-p', 'enable_imu_prediction:=true', '-p', 'publish_tf:=false',
             '-p', 'body_frame_override:=fastlio_body']
     with ros_nodes(tmp_path, [('lio_node', args)]) as node:

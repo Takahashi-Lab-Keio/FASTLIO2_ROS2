@@ -52,6 +52,7 @@ struct NodeConfig
     double imu_acc_scale = 1.0;
     double maximum_imu_gap_seconds = 0.1;
     double maximum_lidar_gap_seconds = 1.0;
+    double startup_continuous_input_seconds = 0.0;
     size_t maximum_imu_queue_size = 4000;
     size_t maximum_lidar_queue_size = 20;
 
@@ -75,6 +76,14 @@ struct StateData
     std::mutex lidar_mutex;
     double last_lidar_time = -std::numeric_limits<double>::infinity();
     double last_imu_time = -std::numeric_limits<double>::infinity();
+    // Protected by imu_mutex (queue resets also require lidar_mutex).
+    // Recovery is allowed only before the first externally visible pose.
+    bool estimation_started = false;
+    double startup_imu_begin = std::numeric_limits<double>::infinity();
+    double startup_lidar_begin = std::numeric_limits<double>::infinity();
+    uint64_t startup_generation = 0;
+    double startup_not_before = -std::numeric_limits<double>::infinity();
+    bool startup_needs_scan_coverage = true;
     std::deque<IMUData> imu_buffer;
     struct LidarMeasurement
     {
@@ -132,7 +141,8 @@ public:
     {
         loadParameters();
 
-        const auto imu_qos = rclcpp::QoS(200).reliable().durability_volatile();
+        // Keep startup/DDS bursts without treating missing samples as valid IMU data.
+        const auto imu_qos = rclcpp::QoS(2000).reliable().durability_volatile();
         const auto lidar_qos = rclcpp::QoS(10).reliable().durability_volatile();
         // A separate executor owns this group. LiDAR deskewing, map updates and
         // cloud serialization cannot occupy its executor thread.
@@ -211,6 +221,12 @@ private:
             config["maximum_imu_gap_seconds"].as<double>(0.1);
         m_node_config.maximum_lidar_gap_seconds =
             config["maximum_lidar_gap_seconds"].as<double>(1.0);
+        m_node_config.startup_continuous_input_seconds = declare_parameter<double>(
+            "startup_continuous_input_seconds",
+            config["startup_continuous_input_seconds"].as<double>(0.0));
+        if (!std::isfinite(m_node_config.startup_continuous_input_seconds) ||
+            m_node_config.startup_continuous_input_seconds < 0.0)
+            throw std::runtime_error("startup_continuous_input_seconds must be finite and non-negative");
         m_node_config.maximum_imu_queue_size =
             config["maximum_imu_queue_size"].as<size_t>(4000U);
         m_node_config.maximum_lidar_queue_size =
@@ -381,7 +397,7 @@ private:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
+        std::scoped_lock lock(m_state_data.imu_mutex, m_state_data.lidar_mutex);
         const auto timestamp_status = FastlioTransforms::classifyTimestamp(
             timestamp, m_state_data.last_imu_time, 0.5,
             m_node_config.maximum_imu_gap_seconds);
@@ -404,14 +420,20 @@ private:
         }
         if (timestamp_status == FastlioTransforms::TimestampStatus::FATAL_FORWARD_GAP)
         {
-            RCLCPP_FATAL(
-                get_logger(),
-                "IMU clock jumped forward by %.3f s (limit %.3f s); restart lio_node",
-                timestamp - m_state_data.last_imu_time,
-                m_node_config.maximum_imu_gap_seconds);
-            rclcpp::shutdown();
-            return;
+            const double gap = timestamp - m_state_data.last_imu_time;
+            if (!restartStartupAfterGap("imu", timestamp, gap))
+            {
+                RCLCPP_FATAL(
+                    get_logger(),
+                    "IMU timestamp gap of %.3f s (limit %.3f s) after estimation started; restart lio_node",
+                    gap, m_node_config.maximum_imu_gap_seconds);
+                rclcpp::shutdown();
+                return;
+            }
         }
+        m_state_data.last_imu_time = timestamp;
+        if (timestamp < m_state_data.startup_not_before) return;
+        m_state_data.startup_imu_begin = std::min(m_state_data.startup_imu_begin, timestamp);
         while (m_state_data.imu_buffer.size() >=
                m_node_config.maximum_imu_queue_size)
         {
@@ -423,12 +445,40 @@ private:
         m_state_data.imu_buffer.emplace_back(
             FastlioTransforms::scaleImuAcceleration(acceleration, m_node_config.imu_acc_scale),
             angular_velocity, timestamp);
-        m_state_data.last_imu_time = timestamp;
         if (m_prediction_enabled)
         {
             std::lock_guard<std::mutex> prediction_lock(m_prediction_mutex);
             m_predictor->add(m_state_data.imu_buffer.back());
         }
+    }
+
+    // Both sensor queue mutexes must be held. Do not touch the estimator here:
+    // it may be processing a package on the other executor. The generation
+    // check in timerCB discards that result and rebuilds it on its own thread.
+    bool restartStartupAfterGap(const std::string &sensor, double stamp, double gap)
+    {
+        if (m_state_data.estimation_started) return false;
+        ++m_state_data.startup_generation;
+        m_state_data.startup_not_before = std::max(m_state_data.startup_not_before, stamp);
+        m_state_data.startup_needs_scan_coverage = true;
+        m_state_data.startup_imu_begin = std::numeric_limits<double>::infinity();
+        m_state_data.startup_lidar_begin = std::numeric_limits<double>::infinity();
+        m_state_data.imu_buffer.clear();
+        m_state_data.lidar_buffer.clear();
+        m_state_data.lidar_pushed = false;
+        {
+            std::lock_guard<std::mutex> prediction_lock(m_prediction_mutex);
+            m_predictor->reset();
+        }
+        RCLCPP_WARN(
+            get_logger(),
+            "%s timestamp gap of %.3f s during startup; discarding initialization data and waiting for continuous input (retry %lu)",
+            sensor.c_str(), gap, static_cast<unsigned long>(m_state_data.startup_generation));
+        processingDiagnostic("startup_waiting_after_" + sensor + "_gap", stamp,
+            {{"gap_seconds", gap},
+             {"startup_retry_count", double(m_state_data.startup_generation)},
+             {"startup_not_before", m_state_data.startup_not_before}}, true);
+        return true;
     }
 
     void processingDiagnostic(const std::string &stage, double stamp,
@@ -489,7 +539,7 @@ private:
             return;
         }
 
-        std::lock_guard<std::mutex> lock(m_state_data.lidar_mutex);
+        std::scoped_lock lock(m_state_data.imu_mutex, m_state_data.lidar_mutex);
         const auto timestamp_status = FastlioTransforms::classifyTimestamp(
             timestamp, m_state_data.last_lidar_time, 0.5,
             m_node_config.maximum_lidar_gap_seconds);
@@ -512,14 +562,22 @@ private:
         }
         if (timestamp_status == FastlioTransforms::TimestampStatus::FATAL_FORWARD_GAP)
         {
-            RCLCPP_FATAL(
-                get_logger(),
-                "Lidar clock jumped forward by %.3f s (limit %.3f s); restart lio_node",
-                timestamp - m_state_data.last_lidar_time,
-                m_node_config.maximum_lidar_gap_seconds);
-            rclcpp::shutdown();
-            return;
+            const double gap = timestamp - m_state_data.last_lidar_time;
+            if (!restartStartupAfterGap("lidar", timestamp, gap))
+            {
+                RCLCPP_FATAL(
+                    get_logger(),
+                    "LiDAR timestamp gap of %.3f s (limit %.3f s) after estimation started; restart lio_node",
+                    gap, m_node_config.maximum_lidar_gap_seconds);
+                rclcpp::shutdown();
+                return;
+            }
         }
+        m_state_data.last_lidar_time = timestamp;
+        // Even a scan whose END is after the gap cannot be deskewed if it
+        // starts before the new continuous IMU history.
+        if (timestamp < m_state_data.startup_not_before) return;
+        m_state_data.startup_lidar_begin = std::min(m_state_data.startup_lidar_begin, timestamp);
         m_state_data.lidar_buffer.push_back(
             {timestamp, timestamp + converted.maximum_offset_ms * 1e-3, converted.cloud, received});
         while (m_state_data.lidar_buffer.size() >
@@ -532,7 +590,6 @@ private:
                 get_logger(), *get_clock(), 2000,
                 "LiDAR queue reached its limit; dropping oldest scans while waiting for IMU");
         }
-        m_state_data.last_lidar_time = timestamp;
         processingDiagnostic("received", timestamp, {
             {"receive_age_ms", receive_age_ms}, {"receive_interval_ms", receive_interval_ms},
             {"scan_end_age_ms", receive_age_ms - converted.maximum_offset_ms},
@@ -546,11 +603,18 @@ private:
             {"queue_drops", double(m_cloud_queue_drops)}});
     }
 
-    bool syncPackage()
+    bool syncPackage(uint64_t &startup_generation)
     {
         std::scoped_lock lock(m_state_data.imu_mutex, m_state_data.lidar_mutex);
         if (m_state_data.imu_buffer.empty() || m_state_data.lidar_buffer.empty())
         {
+            return false;
+        }
+        if (m_state_data.startup_needs_scan_coverage &&
+            m_state_data.imu_buffer.front().time > m_state_data.lidar_buffer.front().start_time)
+        {
+            m_state_data.lidar_buffer.pop_front();
+            m_state_data.lidar_pushed = false;
             return false;
         }
         if (!m_state_data.lidar_pushed)
@@ -597,6 +661,8 @@ private:
                 "Dropping cloud without an IMU sample at or before scan end");
             return false;
         }
+        m_state_data.startup_needs_scan_coverage = false;
+        startup_generation = m_state_data.startup_generation;
         return true;
     }
 
@@ -818,9 +884,19 @@ private:
 
     void timerCB()
     {
-        if (!syncPackage())
+        uint64_t startup_generation;
+        if (!syncPackage(startup_generation))
         {
             return;
+        }
+        if (m_estimator_generation != startup_generation)
+        {
+            // Includes IMU initialization cache/biases and a partially built
+            // map. Never reuse a pre-gap package or initialization result.
+            m_kf = std::make_shared<IESKF>();
+            m_kf->setMaxIter(static_cast<size_t>(m_builder_config.ieskf_max_iter));
+            m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
+            m_estimator_generation = startup_generation;
         }
         const auto start = std::chrono::steady_clock::now();
         try
@@ -835,6 +911,21 @@ private:
             return;
         }
         const auto finish = std::chrono::steady_clock::now();
+        double continuous_input_seconds = 0.0;
+        bool startup_ready = false;
+        {
+            std::lock_guard<std::mutex> lock(m_state_data.imu_mutex);
+            if (startup_generation != m_state_data.startup_generation) return;
+            continuous_input_seconds = std::max(0.0,
+                std::min(m_state_data.last_imu_time, m_package.cloud_end_time) -
+                std::max(m_state_data.startup_imu_begin, m_state_data.startup_lidar_begin));
+            startup_ready = m_state_data.estimation_started || continuous_input_seconds >=
+                m_node_config.startup_continuous_input_seconds;
+            // Commit under the same mutex used by gap detection: either this
+            // result is rejected, or all subsequent gaps retain fatal handling.
+            if (m_builder->status() == BuilderStatus::MAPPING && startup_ready)
+                m_state_data.estimation_started = true;
+        }
         if (m_node_config.print_time_cost)
         {
             const double milliseconds =
@@ -848,6 +939,8 @@ private:
                 {"scan_end_age_ms", (now().seconds() - m_package.cloud_end_time) * 1000},
                 {"queue_wait_ms", m_processing_queue_ms},
                 {"imu_wait_ticks_total", double(m_imu_wait_ticks)},
+                {"startup_continuous_input_seconds", continuous_input_seconds},
+                {"startup_required_seconds", m_node_config.startup_continuous_input_seconds},
                 {"estimator_ms", estimator_ms},
                 {"output_ms", std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - finish).count()},
@@ -856,6 +949,18 @@ private:
         if (m_builder->status() != BuilderStatus::MAPPING)
         {
             emit_processing("initializing");
+            return;
+        }
+        if (!startup_ready)
+        {
+            // Mapping may already be initialized, but no pose, cloud, TF or
+            // predictor correction can escape until the startup window passes.
+            // A gap here can still reset the estimator without changing an
+            // externally visible odometry origin.
+            emit_processing("startup_waiting_for_continuous_input");
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                "Waiting for continuous sensor input before publishing poses: %.2f / %.2f s",
+                continuous_input_seconds, m_node_config.startup_continuous_input_seconds);
             return;
         }
 
@@ -921,6 +1026,7 @@ private:
     Config m_builder_config;
     std::shared_ptr<IESKF> m_kf;
     std::shared_ptr<MapBuilder> m_builder;
+    uint64_t m_estimator_generation = 0;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
 };
 
