@@ -1,5 +1,8 @@
 #include "imu_processor.h"
 
+#include <cmath>
+#include <stdexcept>
+
 IMUProcessor::IMUProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_config(config), m_kf(kf)
 {
     m_Q.setIdentity();
@@ -27,12 +30,22 @@ bool IMUProcessor::initialize(SyncPackage &package)
     }
     acc_mean /= static_cast<double>(m_imu_cache.size());
     gyro_mean /= static_cast<double>(m_imu_cache.size());
+    const double acceleration_norm = acc_mean.norm();
+    if (!std::isfinite(acceleration_norm) ||
+        acceleration_norm < m_config.imu_init_accel_min ||
+        acceleration_norm > m_config.imu_init_accel_max)
+    {
+        throw std::runtime_error(
+            "mean startup acceleration is outside the configured SI range; "
+            "check the IMU units and keep the sensor stationary");
+    }
     m_kf->x().r_il = m_config.r_il;
     m_kf->x().t_il = m_config.t_il;
     m_kf->x().bg = gyro_mean;
     if (m_config.gravity_align)
     {
-        m_kf->x().r_wi = (Eigen::Quaterniond::FromTwoVectors((-acc_mean).normalized(), V3D(0.0, 0.0, -1.0)).matrix());
+        m_kf->x().r_wi =
+            FastlioSo3::alignVectors(-acc_mean, V3D(0.0, 0.0, -1.0));
         m_kf->x().initGravityDir(V3D(0, 0, -1.0));
     }
     else
@@ -119,7 +132,7 @@ void IMUProcessor::undistort(SyncPackage &package)
         {
             dt = it_pcl->curvature / double(1000) - head->offset;
             V3D point(it_pcl->x, it_pcl->y, it_pcl->z);
-            M3D point_rot = imu_r_wi * Sophus::SO3d::exp(imu_gyro * dt).matrix();
+            M3D point_rot = imu_r_wi * FastlioSo3::exp(imu_gyro * dt);
             V3D point_pos = imu_t_wi + imu_vel * dt + 0.5 * imu_acc * dt * dt;
             V3D p_compensate = cur_r_il.transpose() * (cur_r_wi.transpose() * (point_rot * (cur_r_il * point + cur_t_il) + point_pos - cur_t_wi) - cur_t_il);
             it_pcl->x = p_compensate(0);

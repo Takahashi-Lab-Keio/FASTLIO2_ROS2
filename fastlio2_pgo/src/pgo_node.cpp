@@ -1,0 +1,461 @@
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/common/point_tests.h>
+#include <pcl/filters/voxel_grid.h>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <algorithm>
+#include <cmath>
+#include <queue>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
+#include "pgos/commons.h"
+#include "pgos/simple_pgo.h"
+#include "fastlio2_interfaces/srv/save_maps.hpp"
+#include <pcl/io/pcd_io.h>
+#include <fstream>
+#include <yaml-cpp/yaml.h>
+
+using namespace std::chrono_literals;
+
+struct NodeConfig
+{
+    std::string cloud_topic = "/lio/body_cloud";
+    std::string odom_topic = "/lio/odom";
+    std::string map_frame = "map";
+    std::string local_frame = "fastlio_odom";
+    std::string body_frame = "base_footprint";
+    double save_map_resolution = 0.1;
+};
+
+struct NodeState
+{
+    std::mutex message_mutex;
+    std::queue<CloudWithPose> cloud_buffer;
+    double last_message_time = -std::numeric_limits<double>::infinity();
+};
+
+class PGONode : public rclcpp::Node
+{
+public:
+    PGONode() : Node("pgo_node")
+    {
+        RCLCPP_INFO(this->get_logger(), "PGO node started");
+#ifndef FASTLIO2_HAS_GTSAM
+        RCLCPP_WARN(
+            this->get_logger(),
+            "GTSAM is unavailable: mapping and map saving work, but loop closure is disabled");
+#endif
+        loadParameters();
+        m_pgo = std::make_shared<SimplePGO>(m_pgo_config);
+        rclcpp::QoS qos = rclcpp::QoS(10);
+        m_cloud_sub.subscribe(this, m_node_config.cloud_topic, qos.get_rmw_qos_profile());
+        m_odom_sub.subscribe(this, m_node_config.odom_topic, qos.get_rmw_qos_profile());
+        m_loop_marker_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("loop_markers", 10);
+        m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
+        m_sync->setAgePenalty(0.1);
+        m_sync->registerCallback(std::bind(&PGONode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
+        m_timer = this->create_wall_timer(50ms, std::bind(&PGONode::timerCB, this));
+        m_save_map_srv = this->create_service<fastlio2_interfaces::srv::SaveMaps>("save_maps", std::bind(&PGONode::saveMapsCB, this, std::placeholders::_1, std::placeholders::_2));
+    }
+
+    void loadParameters()
+    {
+        this->declare_parameter("config_path", "");
+        std::string config_path;
+        this->get_parameter<std::string>("config_path", config_path);
+        YAML::Node config = YAML::LoadFile(config_path);
+        if (!config)
+        {
+            RCLCPP_WARN(this->get_logger(), "FAIL TO LOAD YAML FILE!");
+            return;
+        }
+        RCLCPP_INFO(this->get_logger(), "LOAD FROM YAML CONFIG PATH: %s", config_path.c_str());
+        m_node_config.cloud_topic = config["cloud_topic"].as<std::string>();
+        m_node_config.odom_topic = config["odom_topic"].as<std::string>();
+        m_node_config.map_frame = config["map_frame"].as<std::string>();
+        m_node_config.local_frame = config["local_frame"].as<std::string>();
+        m_node_config.body_frame = config["body_frame"].as<std::string>(m_node_config.body_frame);
+        m_node_config.save_map_resolution =
+            config["save_map_resolution"].as<double>(m_node_config.save_map_resolution);
+        if (!std::isfinite(m_node_config.save_map_resolution) ||
+            m_node_config.save_map_resolution < 0.0)
+        {
+            throw std::runtime_error("save_map_resolution must be finite and non-negative");
+        }
+
+        m_pgo_config.key_pose_delta_deg = config["key_pose_delta_deg"].as<double>();
+        m_pgo_config.key_pose_delta_trans = config["key_pose_delta_trans"].as<double>();
+        m_pgo_config.loop_search_radius = config["loop_search_radius"].as<double>();
+        m_pgo_config.loop_time_tresh = config["loop_time_tresh"].as<double>();
+        m_pgo_config.loop_score_tresh = config["loop_score_tresh"].as<double>();
+        m_pgo_config.loop_submap_half_range = config["loop_submap_half_range"].as<int>();
+        m_pgo_config.submap_resolution = config["submap_resolution"].as<double>();
+        m_pgo_config.min_loop_detect_duration = config["min_loop_detect_duration"].as<double>();
+    }
+    void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
+    {
+        if (cloud_msg->header.frame_id != m_node_config.body_frame ||
+            odom_msg->header.frame_id != m_node_config.local_frame ||
+            odom_msg->child_frame_id != m_node_config.body_frame)
+        {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Dropping LIO pair with unexpected frames cloud=%s odom=%s->%s",
+                cloud_msg->header.frame_id.c_str(), odom_msg->header.frame_id.c_str(),
+                odom_msg->child_frame_id.c_str());
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_state.message_mutex);
+        CloudWithPose cp;
+        cp.pose.setTime(cloud_msg->header.stamp.sec, cloud_msg->header.stamp.nanosec);
+        if (!std::isfinite(cp.pose.second) || cp.pose.second <= m_state.last_message_time)
+        {
+            RCLCPP_WARN(this->get_logger(), "Received out of order message");
+            return;
+        }
+        m_state.last_message_time = cp.pose.second;
+
+        Eigen::Quaterniond quaternion(odom_msg->pose.pose.orientation.w,
+                                      odom_msg->pose.pose.orientation.x,
+                                      odom_msg->pose.pose.orientation.y,
+                                      odom_msg->pose.pose.orientation.z);
+        cp.pose.t = V3D(odom_msg->pose.pose.position.x, odom_msg->pose.pose.position.y, odom_msg->pose.pose.position.z);
+        if (!cp.pose.t.allFinite() || !quaternion.coeffs().allFinite() ||
+            std::abs(quaternion.norm() - 1.0) > 1e-3)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Dropping non-finite or non-unit LIO pose");
+            return;
+        }
+        cp.pose.r = quaternion.normalized().toRotationMatrix();
+        cp.cloud = CloudType::Ptr(new CloudType);
+        pcl::fromROSMsg(*cloud_msg, *cp.cloud);
+        if (cp.cloud->empty() || !std::all_of(cp.cloud->begin(), cp.cloud->end(), [](const PointType &point) {
+                return pcl::isFinite(point) && std::isfinite(point.intensity);
+            }))
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Dropping empty or non-finite LIO cloud");
+            return;
+        }
+        m_state.cloud_buffer.push(cp);
+    }
+
+    void sendBroadCastTF(builtin_interfaces::msg::Time &time)
+    {
+        geometry_msgs::msg::TransformStamped transformStamped;
+        transformStamped.header.frame_id = m_node_config.map_frame;
+        transformStamped.child_frame_id = m_node_config.local_frame;
+        transformStamped.header.stamp = time;
+        Eigen::Quaterniond q(m_pgo->offsetR());
+        q.normalize();
+        V3D t = m_pgo->offsetT();
+        transformStamped.transform.translation.x = t.x();
+        transformStamped.transform.translation.y = t.y();
+        transformStamped.transform.translation.z = t.z();
+        transformStamped.transform.rotation.x = q.x();
+        transformStamped.transform.rotation.y = q.y();
+        transformStamped.transform.rotation.z = q.z();
+        transformStamped.transform.rotation.w = q.w();
+        m_tf_broadcaster->sendTransform(transformStamped);
+    }
+
+    void publishLoopMarkers(builtin_interfaces::msg::Time &time)
+    {
+        if (m_loop_marker_pub->get_subscription_count() == 0)
+            return;
+        if (m_pgo->historyPairs().size() == 0)
+            return;
+
+        visualization_msgs::msg::MarkerArray marker_array;
+        visualization_msgs::msg::Marker nodes_marker;
+        visualization_msgs::msg::Marker edges_marker;
+        nodes_marker.header.frame_id = m_node_config.map_frame;
+        nodes_marker.header.stamp = time;
+        nodes_marker.ns = "pgo_nodes";
+        nodes_marker.id = 0;
+        nodes_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+        nodes_marker.action = visualization_msgs::msg::Marker::ADD;
+        nodes_marker.pose.orientation.w = 1.0;
+        nodes_marker.scale.x = 0.3;
+        nodes_marker.scale.y = 0.3;
+        nodes_marker.scale.z = 0.3;
+        nodes_marker.color.r = 1.0;
+        nodes_marker.color.g = 0.8;
+        nodes_marker.color.b = 0.0;
+        nodes_marker.color.a = 1.0;
+
+        edges_marker.header.frame_id = m_node_config.map_frame;
+        edges_marker.header.stamp = time;
+        edges_marker.ns = "pgo_edges";
+        edges_marker.id = 1;
+        edges_marker.type = visualization_msgs::msg::Marker::LINE_LIST;
+        edges_marker.action = visualization_msgs::msg::Marker::ADD;
+        edges_marker.pose.orientation.w = 1.0;
+        edges_marker.scale.x = 0.1;
+        edges_marker.color.r = 0.0;
+        edges_marker.color.g = 0.8;
+        edges_marker.color.b = 0.0;
+        edges_marker.color.a = 1.0;
+
+        std::vector<KeyPoseWithCloud> &poses = m_pgo->keyPoses();
+        std::vector<std::pair<size_t, size_t>> &pairs = m_pgo->historyPairs();
+        for (size_t i = 0; i < pairs.size(); i++)
+        {
+            size_t i1 = pairs[i].first;
+            size_t i2 = pairs[i].second;
+            geometry_msgs::msg::Point p1, p2;
+            p1.x = poses[i1].t_global.x();
+            p1.y = poses[i1].t_global.y();
+            p1.z = poses[i1].t_global.z();
+
+            p2.x = poses[i2].t_global.x();
+            p2.y = poses[i2].t_global.y();
+            p2.z = poses[i2].t_global.z();
+
+            nodes_marker.points.push_back(p1);
+            nodes_marker.points.push_back(p2);
+            edges_marker.points.push_back(p1);
+            edges_marker.points.push_back(p2);
+        }
+
+        marker_array.markers.push_back(nodes_marker);
+        marker_array.markers.push_back(edges_marker);
+        m_loop_marker_pub->publish(marker_array);
+    }
+
+    void timerCB()
+    {
+        CloudWithPose cp;
+        {
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
+            if (m_state.cloud_buffer.empty())
+                return;
+            // Keep the most recent synchronized scan if processing fell behind.
+            cp = m_state.cloud_buffer.back();
+            while (!m_state.cloud_buffer.empty())
+            {
+                m_state.cloud_buffer.pop();
+            }
+        }
+        builtin_interfaces::msg::Time cur_time;
+        cur_time.sec = cp.pose.sec;
+        cur_time.nanosec = cp.pose.nsec;
+        if (!m_pgo->addKeyPose(cp))
+        {
+
+            sendBroadCastTF(cur_time);
+            return;
+        }
+
+        m_pgo->searchForLoopPairs();
+
+        m_pgo->smoothAndUpdate();
+
+        sendBroadCastTF(cur_time);
+
+        publishLoopMarkers(cur_time);
+    }
+
+    void saveMapsCB(const std::shared_ptr<fastlio2_interfaces::srv::SaveMaps::Request> request, std::shared_ptr<fastlio2_interfaces::srv::SaveMaps::Response> response)
+    {
+        namespace fs = std::filesystem;
+        const fs::path output_dir(request->file_path);
+        std::error_code error;
+        if (!fs::exists(output_dir, error) || !fs::is_directory(output_dir, error))
+        {
+            response->success = false;
+            response->message = request->file_path + " is not an existing directory";
+            return;
+        }
+        if (error)
+        {
+            response->success = false;
+            response->message = "failed to inspect output directory: " + error.message();
+            return;
+        }
+        const bool output_is_empty = fs::is_empty(output_dir, error);
+        if (error)
+        {
+            response->success = false;
+            response->message = "failed to inspect output directory contents: " + error.message();
+            return;
+        }
+        if (!output_is_empty)
+        {
+            response->success = false;
+            response->message = "refusing to overwrite a non-empty output directory";
+            return;
+        }
+        if (m_pgo->keyPoses().empty())
+        {
+            response->success = false;
+            response->message = "no key poses are available";
+            return;
+        }
+
+        const fs::path temporary_map = output_dir / ".map.pcd.fastlio2-tmp";
+        const fs::path temporary_poses = output_dir / ".poses.txt.fastlio2-tmp";
+        const fs::path temporary_patches = output_dir / ".patches.fastlio2-tmp";
+        const fs::path map_path = output_dir / "map.pcd";
+        const fs::path poses_path = output_dir / "poses.txt";
+        const fs::path patches_path = output_dir / "patches";
+        auto cleanup_temporary_outputs = [&]() {
+            std::error_code cleanup_error;
+            fs::remove(temporary_map, cleanup_error);
+            cleanup_error.clear();
+            fs::remove(temporary_poses, cleanup_error);
+            cleanup_error.clear();
+            fs::remove_all(temporary_patches, cleanup_error);
+        };
+
+        if (request->save_patches && !fs::create_directory(temporary_patches, error))
+        {
+            response->success = false;
+            response->message = "failed to create temporary patches directory: " + error.message();
+            cleanup_temporary_outputs();
+            return;
+        }
+
+        std::ofstream poses_file(temporary_poses, std::ios::out | std::ios::trunc);
+        if (!poses_file.is_open())
+        {
+            response->success = false;
+            response->message = "failed to open temporary poses file";
+            cleanup_temporary_outputs();
+            return;
+        }
+        poses_file << "# patch x y z qw qx qy qz\n";
+
+        CloudType::Ptr ret(new CloudType);
+        for (size_t i = 0; i < m_pgo->keyPoses().size(); i++)
+        {
+            const KeyPoseWithCloud &key_pose = m_pgo->keyPoses()[i];
+            const CloudType::Ptr &body_cloud = key_pose.body_cloud;
+            const bool finite_cloud = body_cloud &&
+                std::all_of(body_cloud->begin(), body_cloud->end(), [](const PointType &point) {
+                    return pcl::isFinite(point) && std::isfinite(point.intensity);
+                });
+            if (!finite_cloud || body_cloud->empty() || !key_pose.r_global.allFinite() ||
+                !key_pose.t_global.allFinite() ||
+                !(key_pose.r_global.transpose() * key_pose.r_global).isApprox(M3D::Identity(), 1e-3))
+            {
+                response->success = false;
+                response->message = "key pose contains invalid pose or point-cloud data";
+                poses_file.close();
+                cleanup_temporary_outputs();
+                return;
+            }
+            const std::string patch_name = std::to_string(i) + ".pcd";
+            if (request->save_patches)
+            {
+                const fs::path patch_path = temporary_patches / patch_name;
+                if (pcl::io::savePCDFileBinary(patch_path.string(), *body_cloud) < 0)
+                {
+                    response->success = false;
+                    response->message = "failed to write patch " + patch_name;
+                    poses_file.close();
+                    cleanup_temporary_outputs();
+                    return;
+                }
+            }
+            Eigen::Quaterniond quaternion(key_pose.r_global);
+            quaternion.normalize();
+            const V3D &translation = key_pose.t_global;
+            // Pose lines are useful even when patches are not requested.
+            poses_file << patch_name << " " << translation.x() << " " << translation.y() << " "
+                       << translation.z() << " " << quaternion.w() << " " << quaternion.x() << " "
+                       << quaternion.y() << " " << quaternion.z() << "\n";
+            CloudType::Ptr world_cloud(new CloudType);
+            pcl::transformPointCloud(*body_cloud, *world_cloud, key_pose.t_global, quaternion);
+            *ret += *world_cloud;
+        }
+        poses_file.close();
+        if (!poses_file || ret->empty())
+        {
+            response->success = false;
+            response->message = "failed to write poses or generated an empty map";
+            cleanup_temporary_outputs();
+            return;
+        }
+        if (m_node_config.save_map_resolution > 0.0)
+        {
+            pcl::VoxelGrid<PointType> voxel_filter;
+            voxel_filter.setLeafSize(
+                m_node_config.save_map_resolution,
+                m_node_config.save_map_resolution,
+                m_node_config.save_map_resolution);
+            voxel_filter.setInputCloud(ret);
+            CloudType::Ptr downsampled(new CloudType);
+            voxel_filter.filter(*downsampled);
+            ret = downsampled;
+            if (ret->empty())
+            {
+                response->success = false;
+                response->message = "map is empty after voxel filtering";
+                cleanup_temporary_outputs();
+                return;
+            }
+        }
+        if (pcl::io::savePCDFileBinary(temporary_map.string(), *ret) < 0)
+        {
+            response->success = false;
+            response->message = "failed to write temporary map";
+            cleanup_temporary_outputs();
+            return;
+        }
+
+        fs::rename(temporary_map, map_path, error);
+        if (!error)
+            fs::rename(temporary_poses, poses_path, error);
+        if (!error && request->save_patches)
+            fs::rename(temporary_patches, patches_path, error);
+        if (error)
+        {
+            response->success = false;
+            response->message = "failed to finalize map outputs: " + error.message();
+            cleanup_temporary_outputs();
+            std::error_code rollback_error;
+            fs::remove(map_path, rollback_error);
+            rollback_error.clear();
+            fs::remove(poses_path, rollback_error);
+            rollback_error.clear();
+            fs::remove_all(patches_path, rollback_error);
+            return;
+        }
+        RCLCPP_INFO(get_logger(), "Saved %zu key poses to %s", m_pgo->keyPoses().size(), map_path.string().c_str());
+        response->success = true;
+        response->message = "map saved successfully";
+    }
+
+private:
+    NodeConfig m_node_config;
+    Config m_pgo_config;
+    NodeState m_state;
+    std::shared_ptr<SimplePGO> m_pgo;
+    rclcpp::TimerBase::SharedPtr m_timer;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr m_loop_marker_pub;
+    rclcpp::Service<fastlio2_interfaces::srv::SaveMaps>::SharedPtr m_save_map_srv;
+    message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
+    message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
+    std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
+    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>> m_sync;
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    rclcpp::spin(std::make_shared<PGONode>());
+    rclcpp::shutdown();
+    return 0;
+}

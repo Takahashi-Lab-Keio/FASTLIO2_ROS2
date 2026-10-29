@@ -44,6 +44,8 @@ struct Config
     double nba = 0.0001;
     double nbg = 0.0001;
     int imu_init_num = 20;
+    double imu_init_accel_min = 5.0;
+    double imu_init_accel_max = 15.0;
     int near_search_num = 5;
     int ieskf_max_iter = 5;
     bool gravity_align = true;
@@ -61,7 +63,7 @@ struct IMUData
     V3D gyro;
     double time;
     IMUData() = default;
-    IMUData(const V3D &a, const V3D &g, double &t) : acc(a), gyro(g), time(t) {}
+    IMUData(const V3D &a, const V3D &g, double t) : acc(a), gyro(g), time(t) {}
 };
 
 struct Pose

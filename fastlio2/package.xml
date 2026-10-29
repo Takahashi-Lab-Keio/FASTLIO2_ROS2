@@ -3,7 +3,7 @@
 <package format="3">
   <name>fastlio2</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>FAST-LIO2 with generic timed PointCloud2 input, including Hesai JT-128, on ROS 2.</description>
   <maintainer email="zhouzhou@todo.todo">zhouzhou</maintainer>
   <license>MIT</license>
 
@@ -16,12 +16,21 @@
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>pcl_conversions</depend>
-  <depend>livox_ros_driver2</depend>
   <depend>geometry_msgs</depend>
-  
+  <depend>diagnostic_msgs</depend>
+  <depend>fastlio2_interfaces</depend>
+  <depend>yaml-cpp</depend>
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs_py</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

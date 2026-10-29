@@ -1,8 +1,21 @@
-imu_topic: /livox/imu
-lidar_topic: /livox/lidar
-body_frame: body
-world_frame: lidar
+imu_topic: /ouster/imu
+lidar_topic: /ouster/points
+body_frame: base_footprint
+lidar_frame: os_lidar
+imu_frame: os_imu
+world_frame: fastlio_odom
 print_time_cost: false
+require_point_time: true
+maximum_point_time_ms: 200.0
+maximum_imu_gap_seconds: 0.1
+maximum_lidar_gap_seconds: 1.0
+maximum_imu_queue_size: 4000
+maximum_lidar_queue_size: 20
+point_time_field: t
+point_time_mode: relative_nanoseconds
+imu_acc_scale: 1.0
+anchor_output_frame: true
+publish_tf: true
 
 lidar_filter_num: 6
 lidar_min_range: 0.5
@@ -20,13 +33,20 @@ nba: 0.0001
 nbg: 0.0001
 
 imu_init_num: 20
+imu_init_accel_min: 5.0
+imu_init_accel_max: 15.0
 near_search_num: 5
 ieskf_max_iter: 5
 
 gravity_align: true
 esti_il: false
 
-r_il: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-t_il: [-0.011, -0.02329, 0.04412]
+# p_imu = r_il * p_lidar + t_il
+r_il: [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+t_il: [-0.006253, 0.011775, 0.028535]
+
+# p_base = r_bi * p_imu + t_bi
+r_bi: [0.99904983, 0.0, -0.04358619, 0.0, 1.0, 0.0, 0.04358619, 0.0, 0.99904983]
+t_bi: [-0.094086, -0.011775, 0.507910]
 
 lidar_cov_inv: 1000.0

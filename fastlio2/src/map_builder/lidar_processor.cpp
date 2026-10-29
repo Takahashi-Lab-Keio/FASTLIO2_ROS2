@@ -167,6 +167,17 @@ void LidarProcessor::process(SyncPackage &package)
     {
         pcl::copyPointCloud(*package.cloud, *m_cloud_down_lidar);
     }
+    if (m_cloud_down_lidar->empty())
+    {
+        return;
+    }
+    const size_t cloud_size = m_cloud_down_lidar->size();
+    m_cloud_down_world->resize(cloud_size);
+    m_norm_vec->resize(cloud_size);
+    m_effect_cloud_lidar->resize(cloud_size);
+    m_effect_norm_vec->resize(cloud_size);
+    m_nearest_points.resize(cloud_size);
+    m_point_selected_flag.assign(cloud_size, false);
     trimCloudMap();
     m_kf->update();
     incrCloudMap();
@@ -242,12 +253,13 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         const PointType &norm_p = m_effect_norm_vec->points[i];
         Eigen::Vector3d laser_p_vec(laser_p.x, laser_p.y, laser_p.z);
         Eigen::Vector3d norm_vec(norm_p.x, norm_p.y, norm_p.z);
-        Eigen::Matrix<double, 1, 3> B = -norm_vec.transpose() * state.r_wi * Sophus::SO3d::hat(state.r_il * laser_p_vec + state.t_wi);
+        const Eigen::Matrix<double, 1, 3> B =
+            rotationJacobian(state.r_wi, state.r_il, state.t_il, laser_p_vec, norm_vec);
         J.block<1, 3>(0, 0) = B;
         J.block<1, 3>(0, 3) = norm_vec.transpose();
         if (m_config.esti_il)
         {
-            Eigen::Matrix<double, 1, 3> C = -norm_vec.transpose() * state.r_wi * state.r_il * Sophus::SO3d::hat(laser_p_vec);
+            Eigen::Matrix<double, 1, 3> C = -norm_vec.transpose() * state.r_wi * state.r_il * FastlioSo3::hat(laser_p_vec);
             Eigen::Matrix<double, 1, 3> D = norm_vec.transpose() * state.r_wi;
             J.block<1, 3>(0, 6) = C;
             J.block<1, 3>(0, 9) = D;
@@ -255,6 +267,14 @@ void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)
         share_data.H += J.transpose() * m_config.lidar_cov_inv * J;
         share_data.b += J.transpose() * m_config.lidar_cov_inv * norm_p.intensity;
     }
+}
+
+Eigen::Matrix<double, 1, 3> LidarProcessor::rotationJacobian(
+    const M3D &r_wi, const M3D &r_il, const V3D &t_il,
+    const V3D &laser_point, const V3D &normal)
+{
+    return -normal.transpose() * r_wi *
+           FastlioSo3::hat(r_il * laser_point + t_il);
 }
 
 CloudType::Ptr LidarProcessor::transformCloud(CloudType::Ptr inp, const M3D &r, const V3D &t)
