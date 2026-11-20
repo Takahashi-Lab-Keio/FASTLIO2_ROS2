@@ -1,0 +1,20 @@
+cloud_topic: /fastlio2/body_cloud
+odom_topic: /fastlio2/lio_odom
+map_frame: map
+local_frame: fastlio_odom
+body_frame: base_footprint
+# ICP correction rate. The latest map->fastlio_odom transform and global pose
+# are republished at the incoming synchronized LIO rate.
+update_hz: 1.0
+
+rough_scan_resolution: 0.25
+rough_map_resolution: 0.25
+rough_max_iteration: 5
+rough_score_thresh: 0.2
+rough_max_correspondence_distance: 2.0
+
+refine_scan_resolution: 0.1
+refine_map_resolution: 0.1
+refine_max_iteration: 10
+refine_score_thresh: 0.1
+refine_max_correspondence_distance: 0.5

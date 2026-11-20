@@ -1,7 +1,7 @@
 #pragma once
 #include <Eigen/Eigen>
-#include <sophus/so3.hpp>
 #include "commons.h"
+#include "so3_math.h"
 
 using M12D = Eigen::Matrix<double, 12, 12>;
 using M21D = Eigen::Matrix<double, 21, 21>;
@@ -56,6 +56,17 @@ struct State
 
 using loss_func = std::function<void(State &, SharedState &)>;
 using stop_func = std::function<bool(const V21D &)>;
+
+// Shared by the IESKF and the independent high-rate IMU predictor. Preserve
+// the estimator's original first-order integration and SO(3) update exactly.
+inline void propagateState(State &state, const Input &inp, double dt)
+{
+    V21D delta = V21D::Zero();
+    delta.segment<3>(0) = (inp.gyro - state.bg) * dt;
+    delta.segment<3>(3) = state.v * dt;
+    delta.segment<3>(12) = (state.r_wi * (inp.acc - state.ba) + state.g) * dt;
+    state += delta;
+}
 
 class IESKF
 {
