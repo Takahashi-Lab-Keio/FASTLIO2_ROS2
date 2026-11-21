@@ -143,7 +143,8 @@ public:
 
         // Keep startup/DDS bursts without treating missing samples as valid IMU data.
         const auto imu_qos = rclcpp::QoS(2000).reliable().durability_volatile();
-        const auto lidar_qos = rclcpp::QoS(10).reliable().durability_volatile();
+        // Keep only the newest unread scan while the estimator is busy.
+        const auto lidar_qos = rclcpp::QoS(1).reliable().durability_volatile();
         // A separate executor owns this group. LiDAR deskewing, map updates and
         // cloud serialization cannot occupy its executor thread.
         m_imu_group = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
